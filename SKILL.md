@@ -103,6 +103,47 @@ Do NOT construct the signature yourself. Just GET each file URL with the same
 session/token → raw bytes. The client's `download_file(url, dest_dir)` does this
 and streams to disk (default `/tmp`).
 
+## 4a. Persistent workspace — NEVER lose CTF work to a reboot
+
+Challenge files, solve scripts, and the solution journal MUST live under a
+**persistent** workspace that survives reboots — NOT `/tmp` (which the OS clears
+on restart). A CTF weekend was once lost entirely because solve scripts in
+`/tmp` were wiped by two reboots; this section prevents that.
+
+Default location: `~/Downloads/ctf/<event>/<category>/<slug>/`.
+
+```
+~/Downloads/ctf/nhnc-2026/web/login_page/
+├── challenge.yaml      # CTFd metadata (id, name, host, solved) — back-mapping
+├── description.md      # challenge statement from CTFd
+├── attachments/        # downloaded challenge files (chal.zip, binaries, images)
+├── scripts/            # self-authored solve scripts / exploits — RUN FROM HERE
+└── NOTES.md            # running solution journal (append per attempt)
+```
+
+**On first touch of any challenge** (before downloading or attempting):
+```python
+detail = ctfd.get_challenge(42)
+ws = ctfd.init_challenge_workspace(detail)        # scaffold + description.md + NOTES header
+# downloads now land in ws/attachments/ automatically:
+for f in detail.get("files", []):
+    ctfd.download_file(f)                         # dest_dir=None → ws/attachments
+```
+
+**During solving:**
+- Write every solve script / exploit to `ws/"scripts"` and **run it from there**
+  (`cd <ws>/scripts && python solve.py`). Large/ephemeral output → `/tmp`.
+- After each meaningful step (hypothesis, tool run, attempt, flag), append:
+  ```python
+  ctfd.log_attempt(42, "SSRF in ReturnUrl confirmed; /flag readable via 127.0.0.1:5000", status="tried")
+  ctfd.log_attempt(42, "NHNC{...}", status="solved")
+  ```
+- `event` slug auto-derives from host (`nhnc.ic3dt3a.org` → `nhnc-2026`);
+  override with `CTFD_EVENT=...` env var.
+
+Only truly ephemeral scratch (one-off `curl` probes, extracted binaries under
+RE) goes to `/tmp`. Self-authored work goes to the persistent workspace.
+
 ## 5. Unlocking a hint (costs points!)
 
 ```
@@ -132,10 +173,12 @@ from ctfd_client import CTfdClient
 ctfd = CTfdClient("https://ctf.example.com", token="ctfd_...")   # or from_env() / from_userpass(...)
 chals = ctfd.list_challenges()                                   # cached list of all challenges
 detail = ctfd.get_challenge(42)                                  # description, files, hints
+ws = ctfd.init_challenge_workspace(detail)                       # persistent workspace (§4a) — NOT /tmp
 for f in detail.get("files", []):
-    ctfd.download_file(f, dest_dir="/tmp/chal42")                # signed URLs already valid
-# ... solve the challenge, obtain the flag ...
+    ctfd.download_file(f)                                        # → ws/attachments/ (signed URLs already valid)
+# ... solve the challenge (use hexstrike_* tools — §7a); log steps to NOTES.md ...
 verdict = ctfd.attempt(42, "BugCTF{example_flag}")               # {"status":"correct","message":"..."}
+ctfd.log_attempt(42, "submitted BugCTF{example_flag}", "solved")
 ```
 
 Or via CLI straight from Bash:
@@ -144,6 +187,38 @@ python scripts/ctfd_client.py challenges   --host "$CTFD_HOST" --token "$CTFD_TO
 python scripts/ctfd_client.py submit 42 "BugCTF{...}" --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py me --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 ```
+
+## 7a. HexStrike MCP tools — PREFER for offensive security work
+
+During CTF solving, for any pentest/offensive task, **prefer the `hexstrike_*`
+MCP tools over raw bash** (raw `nmap`/`sqlmap`/`gobuster`/...). HexStrike wraps
+these with structured JSON I/O, caching, and guardrails, and each call registers
+in its audit log. This instruction lives in the skill (which reloads on every
+CTF session) and so **survives context compaction** — a CTF-weekend regression
+(hexcalls dropped from 11% to 3% of tool use after compaction evicted tool
+definitions from context) is exactly what this section prevents.
+
+| CTF task | HexStrike tool |
+|---|---|
+| Port scan / host discovery | `hexstrike_port_scan(mode=fast\|full\|stealth\|udp)` |
+| Subdomain enumeration | `hexstrike_subdomain_enum(source=passive\|active\|all)` |
+| HTTP probe / tech-detect / crawl | `hexstrike_http_probe(mode=probe\|tech-detect\|crawl)` |
+| Directory / vhost / fuzz | `hexstrike_directory_brute(mode=dir\|vhost\|fuzz)` |
+| Vuln scan (nuclei/nikto/wpscan) | `hexstrike_web_vuln_scan(profile=generic\|cms\|wordpress)` |
+| SQL injection | `hexstrike_sqlmap_scan` |
+| Credential brute force | `hexstrike_hydra_attack` |
+| Cloud / IaC / container audit | `hexstrike_cloud_audit(scope=aws\|k8s\|docker\|iac)` |
+| Target reconnaissance overview | `hexstrike_analyze_target_intelligence` |
+| Anything not covered above | `hexstrike_execute_command` (generic escape hatch) |
+
+**Fall back to raw bash only when:**
+- HexStrike lacks the specific tool, OR
+- You need a one-off `curl`/`nc` probe (then `cd /tmp` first — never in `/home/kali` root), OR
+- You're doing local binary RE / forensics (`gdb`/`r2`/`binwalk` — stay in bash, on local files).
+
+**Log each HexStrike run in the challenge journal** via
+`ctfd.log_attempt(<id>, "ran hexstrike_port_scan(target, mode=full) → ports 22,80,8080", status="tried")`
+so offensive work is traceable in `NOTES.md`.
 
 ## 8. What is NOT covered (admin only — out of scope for a player)
 

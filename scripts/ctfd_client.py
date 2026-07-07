@@ -79,6 +79,7 @@ class CTfdClient:
         self.timeout = timeout
         self.session = session or requests.Session()
         self._nonce: Optional[str] = None
+        self._active_ws: Optional[Path] = None
         if token:
             # Авторизация токеном: заголовок Authorization + JSON Content-Type.
             # Запрос с Authorization полностью обходит CSRF.
@@ -385,12 +386,17 @@ class CTfdClient:
         params = {"since_id": since_id} if since_id is not None else None
         return self._request("GET", "/notifications", params=params)
 
-    def download_file(self, url: str, dest_dir: str = "/tmp") -> Path:
+    def download_file(self, url: str, dest_dir: Optional[str] = None) -> Path:
         """Скачать файл по URL из get_challenge()['files'].
 
         URL из CTFd — относительный путь вида ``/files/<hash>/<name>?token=...``
         (подпись уже встроена). При необходимости подставляем хост инстанса.
+
+        ``dest_dir=None`` (по умолчанию) → активный воркспейс ``attachments/``
+        (если задан через :meth:`init_challenge_workspace`), иначе ``/tmp``.
         """
+        if dest_dir is None:
+            dest_dir = str(self._active_ws / "attachments") if self._active_ws else "/tmp"
         if url.startswith("/"):
             url = f"{self.host}{url}"
         elif not url.startswith(("http://", "https://")):
@@ -407,6 +413,133 @@ class CTfdClient:
                 for chunk in r.iter_content(8192):
                     fh.write(chunk)
         return out
+
+    # -- персистентный CTF-воркспейс -------------------------------
+    def init_challenge_workspace(
+        self,
+        challenge: Dict[str, Any],
+        base: str = "~/Downloads/ctf",
+    ) -> Path:
+        """Создать персистентный воркспейс для задачи и вернуть путь.
+
+        Структура::
+
+            <base>/<event>/<category>/<slug>/
+            ├── challenge.yaml      метаданные CTFd (id, name, host, ...)
+            ├── description.md      условие задачи
+            ├── attachments/        скачанные файлы
+            ├── scripts/            самописные solve-скрипты (запускать отсюда)
+            └── NOTES.md            журнал хода решения (append)
+
+        ``event`` выводится из host (напр. ``nhnc.ic3dt3a.org`` → ``nhnc-2026``);
+        override через env ``CTFD_EVENT``. Воркспейс переживает ребуты
+        (по умолчанию в ``~/Downloads/ctf``).
+        """
+        base_path = Path(os.path.expanduser(base))
+        event = os.environ.get("CTFD_EVENT") or self._derive_event_slug()
+        category = self._slugify(str(challenge.get("category") or "misc"))
+        name = challenge.get("name") or str(challenge.get("id") or "challenge")
+        slug = self._slugify(name)
+        ws = base_path / event / category / slug
+        (ws / "attachments").mkdir(parents=True, exist_ok=True)
+        (ws / "scripts").mkdir(parents=True, exist_ok=True)
+
+        meta = {
+            "id": challenge.get("id"),
+            "name": challenge.get("name"),
+            "category": challenge.get("category"),
+            "value": challenge.get("value"),
+            "connection_info": challenge.get("connection_info"),
+            "host": self.host,
+            "event": event,
+            "solved": bool(challenge.get("solved_by_me")),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "workspace": str(ws),
+        }
+        (ws / "challenge.yaml").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (ws / "description.md").write_text(
+            challenge.get("description") or "(описание отсутствует)", encoding="utf-8"
+        )
+        notes = ws / "NOTES.md"
+        if not notes.exists():
+            notes.write_text(
+                f"# {challenge.get('name', '?')} — журнал решения\n\n"
+                f"event: {event} · category: {challenge.get('category')} · "
+                f"id: {challenge.get('id')}\nhost: {self.host}\n\n"
+                "Записи: `## [ISO-ts] status` → гипотеза/действие/результат.\n\n",
+                encoding="utf-8",
+            )
+
+        self._active_ws = ws
+        return ws
+
+    def log_attempt(
+        self,
+        challenge_id: int,
+        entry: str,
+        status: Optional[str] = None,
+    ) -> Path:
+        """Дописать датированную запись в ``NOTES.md`` задачи.
+
+        ``status`` — короткая метка (``'hypothesis'``/``'tried'``/``'solved'``/
+        ``'failed'``/...). Если активный воркспейс не задан, ищется по
+        ``challenge_id`` в ``challenge.yaml``; если не найден — запись теряется
+        с предупреждением в stderr.
+        """
+        ws = self._active_ws or self._find_workspace_by_id(challenge_id)
+        if ws is None:
+            print(
+                f"[ctfd] log_attempt: воркспейс для challenge {challenge_id} "
+                f"не найден — запись потеряна",
+                file=sys.stderr,
+            )
+            return Path()
+        self._active_ws = ws
+        notes = ws / "NOTES.md"
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        head = f"## [{ts}] {status}" if status else f"## [{ts}]"
+        with open(notes, "a", encoding="utf-8") as fh:
+            fh.write(f"{head}\n{entry}\n\n")
+        return notes
+
+    @staticmethod
+    def _slugify(text: str) -> str:
+        """lowercase; не-буквы/цифры → ``_``; коллапс повторов; trim."""
+        s = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+        return s or "challenge"
+
+    def _derive_event_slug(self) -> str:
+        """event-слаг из host: ``nhnc.ic3dt3a.org`` → ``nhnc-YYYY``.
+
+        Первый не-generic label (skip www/ctf/chall/...) + текущий год.
+        """
+        from urllib.parse import urlparse
+
+        host = urlparse(self.host).hostname or self.host
+        labels = host.split(".")
+        generic = {"www", "ctf", "chall", "challenge", "api"}
+        cand = next(
+            (l for l in labels if l.lower() not in generic and l),
+            labels[0] if labels else "ctf",
+        )
+        cand = re.sub(r"[^a-z0-9]+", "_", cand.lower()).strip("_") or "ctf"
+        return f"{cand}-{time.strftime('%Y')}"
+
+    def _find_workspace_by_id(self, challenge_id: int) -> Optional[Path]:
+        """Найти воркспейс по ``id`` в ``challenge.yaml`` под базовой папкой."""
+        base = Path(os.path.expanduser("~/Downloads/ctf"))
+        if not base.exists():
+            return None
+        for yaml_file in base.rglob("challenge.yaml"):
+            try:
+                meta = json.loads(yaml_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if meta.get("id") == challenge_id:
+                return yaml_file.parent
+        return None
 
     # -- управление собственными API-токенами --------------------------
     def generate_token(
