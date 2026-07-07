@@ -17,6 +17,9 @@ REST-интерфейс (`/api/v1`). Помогает участвовать в 
 - Автоматический backoff при `429` (антибрутфорс CTFd) — клиент сам читает
   число секунд ожидания из ответа и делает один повтор
 - Скачивание приложенных файлов по уже подписанным URL
+- **Персистентный воркспейс** под каждую задачу (`~/Downloads/ctf/<event>/<category>/<slug>/`) — файлы, скрипты и журнал переживают ребуты (не `/tmp`)
+- **Журнал хода решения** `NOTES.md` — автодополнение датированных записей (гипотеза/попытка/результат)
+- **Подсказка агенту предпочитать `hexstrike_*` MCP-тулы** для offsec-задач (переживает компактизацию контекста)
 - Разблокировка подсказок и официальных решений (с учётом стоимости в баллах)
 - Рейтинг, топ-N, свой профиль, профиль команды
 - Поллинг анонсов организаторов (`since_id`)
@@ -111,9 +114,13 @@ from ctfd_client import CTfdClient
 c = CTfdClient.from_env()                       # читает CTFD_HOST / CTFD_TOKEN
 print(c.list_challenges())                      # список задач
 detail = c.get_challenge(42)                    # условие, файлы, хинты
+ws = c.init_challenge_workspace(detail)         # персистентный воркспейс (НЕ /tmp)
 for f in detail["files"]:
-    c.download_file(f, dest_dir="/tmp/chal42")  # файлы уже с подписью
+    c.download_file(f)                          # → ws/attachments/ (dest_dir=None по умолчанию)
+c.log_attempt(42, "Начало решения", "hypothesis")  # запись в ws/NOTES.md
+# ... решение (для offsec — prefer hexstrike_* тулам, см. SKILL.md §7a) ...
 verdict = c.attempt(42, "BugCTF{example}")      # {"status": "correct", ...}
+c.log_attempt(42, "BugCTF{example}", "solved")
 ```
 
 Авторизация по паролю (если нет токена):
@@ -149,6 +156,35 @@ python examples/solve_flow.py --submit-id 42 --flag 'BugCTF{...}'
 
 > `python examples/solve_flow.py --submit-id 42 --flag '...'` — подача флага
 > выполняется только при явном указании `--submit-id` и `--flag`.
+
+## Персистентный воркспейс
+
+Чтобы файлы задач, solve-скрипты и журнал решения **не терялись при перезагрузке**
+(однажды весь CTF-уикенд ушел в `/tmp`, очищенный ребутами), скилл создаёт под
+каждую задачу персистентную структуру в `~/Downloads/ctf/`:
+
+```
+~/Downloads/ctf/<event>/<category>/<slug>/
+├── challenge.yaml      # метаданные CTFd (id, name, host, solved)
+├── description.md      # условие задачи
+├── attachments/        # скачанные файлы (автоматически через download_file)
+├── scripts/            # самописные solve-скрипты/эксплойты — запускать отсюда
+└── NOTES.md            # журнал хода решения (append через log_attempt)
+```
+
+- `<event>` выводится из host инстанса (`nhnc.ic3dt3a.org` → `nhnc-2026`);
+  override через env `CTFD_EVENT`.
+- `init_challenge_workspace(detail)` создаёт scaffold + `description.md` + заголовок `NOTES.md`.
+- `download_file(f)` без `dest_dir` складывает файлы в `attachments/`.
+- `log_attempt(challenge_id, entry, status)` дописывает датированную запись в
+  `NOTES.md` (`status`: `hypothesis` / `tried` / `solved` / `failed`).
+
+Эпемерный scratch (разовые `curl`-пробы, распакованные бинарники) по-прежнему
+идёт в `/tmp`. Самописные скрипты — в `scripts/` воркспейса.
+
+> **HexStrike-интеграция**: в `SKILL.md` (§7a) агенту предписано prefer'ить
+> `hexstrike_*` MCP-тулы для offsec-задач — инструкция живёт в скилле и не
+> вымывается компактизацией контекста.
 
 ## Безопасность
 
