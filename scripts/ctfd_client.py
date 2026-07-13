@@ -340,8 +340,9 @@ class CTfdClient:
 
         - ``update_seen=True``: diff текущего списка против снапшота
           ``~/Downloads/ctf/<event>/.seen.json``. Новые с последней проверки
-          задачи печатаются в stderr, снапшот обновляется. Первый вызов
-          seed'ит baseline молча.
+          задачи печатаются в stderr, снапшот обновляется. Первый полный
+          (без фильтров) вызов seed'ит baseline с коротким сообщением;
+          фильтрованный вызов до baseline не детектит новые (см. ``baselined``).
         - ``poll_notifications=True``: сливает новые анонсы из
           ``/notifications`` (since_id = курсор в ``.seen.json``), печатает
           каждый в stderr с тегом классификации

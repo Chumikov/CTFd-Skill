@@ -70,6 +70,14 @@ this. Token auth is simpler — prefer it whenever possible.
    `~/Downloads/ctf/<event>/.seen.json` и сливает новые анонсы из
    `/notifications` (подсказки/уточнения организаторов) с тегом классификации.
    Организаторы публикуют задачи и постят подсказки по ходу ивента.
+   Caveats: (а) это **getter с side-effects** — он пишет `.seen.json` и делает
+   **второй HTTP-запрос** к `/notifications`; (б) **первый** опрос вываливает в
+   stderr newest 50 исторических анонсов (лимит `c._notifications_first_limit`,
+   по умолчанию 50); (в) классификация `hint`/`clarification`/`new`/`scoring`/
+   `general` — эвристика по ключевикам, не 100%. Для тихого обзора передайте
+   `update_seen=False` и/или `poll_notifications=False`. **Не вызывайте с
+   фильтром** (`category=...`) до первого полного (без фильтров) вызова —
+   иначе baseline останется неполным и детект новых отключится.
 6. **Возобновление сессии** (новый запуск / после компактизации контекста) —
    перечитать `ws/NOTES.md` активной задачи; periodically сверяться через
    `python scripts/ctfd_client.py status` (ловит дрейф солвов vs сервер).
@@ -144,11 +152,15 @@ lock you out** of that challenge.
 submission even if logging fails):
 
 - appends a dated entry to the active challenge's `NOTES.md` tagged by verdict
-  (`solved` / `failed` / `tried`);
+  (`solved` / `failed` / `tried`) — **every** verdict is logged, not just
+  `correct`: `incorrect` / `partial` / `ratelimited` attempts land in the
+  journal too (tagged `failed` / `tried`), so a brute-force session will
+  produce multiple entries — that's intentional, it's the audit trail;
 - on `correct` / `already_solved` flips `solved: true` (+ `solved_at`) in the
-  local `challenge.yaml` — this builds the back-mapping that was missing on
-  BroncoCTF 2026 (`<ws>/<category>/<slug>/challenge.yaml` ↔ challenge id ↔
-  solved status).
+  local `challenge.json` — this builds the back-mapping that was missing on
+  BroncoCTF 2026 (`<ws>/<category>/<slug>/challenge.json` ↔ challenge id ↔
+  solved status). Legacy `challenge.yaml` is read with fallback and migrated
+  to `.json` on the next `init_challenge_workspace`.
 
 This means the flag submission itself is always recorded. **Intermediate
 steps** (hypotheses, tool runs, wrong guesses before the final attempt) still
@@ -160,7 +172,9 @@ To reconcile local tracking with server truth (catches drift like
 ```bash
 python scripts/ctfd_client.py status          # offline-capable (no token = local-only)
 python scripts/ctfd_client.py sync --dry-run  # preview
-python scripts/ctfd_client.py sync            # backfill challenge.yaml from my_solves()
+python scripts/ctfd_client.py sync            # backfill challenge.json from my_solves()
+python scripts/ctfd_client.py sync --all      # scaffold ALL challenges (not only solved)
+python scripts/ctfd_client.py download-challenge 42   # init ws + download all files
 ```
 
 ## 4. Downloading attached files
@@ -181,12 +195,24 @@ Default location: `~/Downloads/ctf/<event>/<category>/<slug>/`.
 
 ```
 ~/Downloads/ctf/nhnc-2026/web/login_page/
-├── challenge.yaml      # CTFd metadata (id, name, host, solved) — back-mapping
+├── challenge.json      # CTFd metadata (id, name, host, solved) — back-mapping
 ├── description.md      # challenge statement from CTFd
 ├── attachments/        # downloaded challenge files (chal.zip, binaries, images)
 ├── scripts/            # self-authored solve scripts / exploits — RUN FROM HERE
 └── NOTES.md            # running solution journal (append per attempt)
 ```
+
+> `challenge.json` contains JSON (despite older CTFd-Skill versions naming it
+> `challenge.yaml`). Legacy `challenge.yaml` is auto-migrated on the next
+> `init_challenge_workspace`. The event-level snapshot
+> `~/Downloads/ctf/<event>/.seen.json` (new-challenge ids + notification
+> cursor) lives one level up, alongside the category folders.
+
+> **Year-derivation caveat:** `<event>` is derived from the host as
+> `<first-non-generic-label>-<current-year>` (e.g. `nhnc-2026`). For a CTF
+> played near a year boundary, or branded with a different year/season, set
+> `CTFD_EVENT=<correct-slug>` explicitly — otherwise the workspace tree lands
+> under a misnamed folder.
 
 **On first touch of any challenge** (before downloading or attempting):
 ```python
@@ -206,7 +232,7 @@ for f in detail.get("files", []):
   ```
 - The final **flag submission** is logged automatically by `attempt()` — no
   manual `log_attempt(..., "solved")` needed; it also flips `solved: true` in
-  `challenge.yaml` (see §3a).
+  `challenge.json` (see §3a).
 - `event` slug auto-derives from host (`nhnc.ic3dt3a.org` → `nhnc-2026`);
   override with `CTFD_EVENT=...` env var.
 
@@ -250,8 +276,9 @@ for f in detail.get("files", []):
 # ... solve the challenge (use hexstrike_* tools — §7a); log EACH step to NOTES.md ...
 ctfd.log_attempt(42, "SSRF confirmed, /flag readable via 127.0.0.1:5000", "tried")
 verdict = ctfd.attempt(42, "BugCTF{example_flag}")               # {"status":"correct","message":"..."}
-# attempt() АВТОМАТИЧЕСКИ пишет солв в NOTES.md и ставит solved:true в challenge.yaml
-# (§3a). Ручной log_attempt для самого флага больше не нужен — только для
+# attempt() АВТОМАТИЧЕСКИ пишет вердикт в NOTES.md и при correct ставит
+# solved:true в challenge.json (§3a). Логируются ВСЕ вердикты (вкл. incorrect).
+# Ручной log_attempt для самого флага больше не нужен — только для
 # промежуточных шагов (см. чек-лист §0a).
 ```
 
@@ -261,7 +288,7 @@ Reconcile local tracking with server truth anytime (catches drift like
 ```bash
 python scripts/ctfd_client.py status          # offline-capable; local-only if no token
 python scripts/ctfd_client.py sync --dry-run  # preview backfill
-python scripts/ctfd_client.py sync            # rebuild challenge.yaml from my_solves()
+python scripts/ctfd_client.py sync            # rebuild challenge.json from my_solves()
 ```
 
 Or via CLI straight from Bash:
