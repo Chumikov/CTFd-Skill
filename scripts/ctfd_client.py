@@ -51,6 +51,28 @@ _NONCE_PATTERNS = [
 
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+# Маппинг статуса вердикта CTFd -> метка журнала NOTES.md.
+_STATUS_LOG: Dict[str, str] = {
+    "correct": "solved",
+    "already_solved": "solved",
+    "incorrect": "failed",
+    "partial": "tried",
+    "ratelimited": "tried",
+    "authentication_required": "tried",
+    "paused": "tried",
+}
+
+# Классификация анонсов по ключевикам (нижний регистр). Порядок = приоритет.
+_NOTIFY_KEYWORDS = [
+    ("hint", ("hint", "подсказк")),
+    ("clarification", ("clarif", "уточнен", "typo", "fix:", "исправлен",
+                       "updated", "обновлён", "обновлен", "errata")),
+    ("new", ("new challenge", "новая задач", "released", "published",
+             "опубликован", "добавлен")),
+    ("scoring", ("score", "freeze", "скор", "заморозк", "bonus", "бонус",
+                 "penalt", "штраф")),
+]
+
 
 class CTfdError(Exception):
     """Базовая ошибка клиента CTFd."""
@@ -297,9 +319,37 @@ class CTfdClient:
     # ==================================================================
     #  Player-эндпоинты
     # ==================================================================
-    def list_challenges(self, **filters: Any) -> List[Dict[str, Any]]:
-        """Список челленджей (id, name, category, value, solves, solved_by_me)."""
-        return self._request("GET", "/challenges", params=filters or None)
+    def list_challenges(
+        self,
+        *,
+        update_seen: bool = True,
+        poll_notifications: bool = True,
+        **filters: Any,
+    ) -> List[Dict[str, Any]]:
+        """Список челленджей (id, name, category, value, solves, solved_by_me).
+
+        Заодно — единая точка «что нового»:
+
+        - ``update_seen=True``: diff текущего списка против снапшота
+          ``~/Downloads/ctf/<event>/.seen.json``. Новые с последней проверки
+          задачи печатаются в stderr, снапшот обновляется. Первый вызов
+          seed'ит baseline молча.
+        - ``poll_notifications=True``: сливает новые анонсы из
+          ``/notifications`` (since_id = курсор в ``.seen.json``), печатает
+          каждый в stderr с тегом классификации
+          (``hint``/``clarification``/``new``/``scoring``/``general``),
+          обновляет курсор. Первый опрос показывает все существующие анонсы
+          один раз (включая исторические подсказки), затем — только новые.
+
+        Передайте ``update_seen=False`` / ``poll_notifications=False`` для
+        «тихого» обзора (без записи состояния).
+        """
+        data = self._request("GET", "/challenges", params=filters or None)
+        if update_seen:
+            self._diff_new_challenges(data)
+        if poll_notifications:
+            self._poll_notifications()
+        return data
 
     def get_challenge(self, challenge_id: int) -> Dict[str, Any]:
         """Полное условие: описание, connection_info, файлы, теги, хинты."""
@@ -318,6 +368,12 @@ class CTfdClient:
 
         429 ratelimited обрабатывается автоматически (один повтор после ожидания
         числа секунд из сообщения).
+
+        Побочные эффекты (best-effort, НИКОГДА не рвут сабмит):
+        - автоматически дописывает запись в ``NOTES.md`` активной задачи;
+        - при ``correct``/``already_solved`` выставляет ``solved: true`` в
+          локальном ``challenge.yaml`` (back-mapping «папка ↔ id ↔ solved»).
+        Если воркспейс для задачи не инициализирован — авто-лог тихо пропускается.
         """
         data = self._request(
             "POST",
@@ -325,6 +381,7 @@ class CTfdClient:
             json_body={"challenge_id": challenge_id, "submission": submission},
         )
         if isinstance(data, dict) and "status" in data:
+            self._autolog_attempt(challenge_id, submission, data)
             return data
         return {"status": "unknown", "data": data}
 
@@ -396,7 +453,16 @@ class CTfdClient:
         (если задан через :meth:`init_challenge_workspace`), иначе ``/tmp``.
         """
         if dest_dir is None:
-            dest_dir = str(self._active_ws / "attachments") if self._active_ws else "/tmp"
+            if self._active_ws:
+                dest_dir = str(self._active_ws / "attachments")
+            else:
+                print(
+                    "[ctfd] WARNING: download_file без активного воркспейса — "
+                    "файл сохранён в /tmp. Вызовите init_challenge_workspace(detail), "
+                    "чтобы файлы шли в <ws>/attachments/ и отслеживались в журнале.",
+                    file=sys.stderr,
+                )
+                dest_dir = "/tmp"
         if url.startswith("/"):
             url = f"{self.host}{url}"
         elif not url.startswith(("http://", "https://")):
@@ -541,6 +607,265 @@ class CTfdClient:
                 return yaml_file.parent
         return None
 
+    # ------------------------------------------------------------------
+    #  Состояние события: .seen.json (новые задачи + курсор анонсов)
+    # ------------------------------------------------------------------
+    def _event_dir(self) -> Path:
+        base = Path(os.path.expanduser("~/Downloads/ctf"))
+        event = os.environ.get("CTFD_EVENT") or self._derive_event_slug()
+        d = base / event
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _seen_path(self) -> Path:
+        return self._event_dir() / ".seen.json"
+
+    def _load_seen(self) -> Dict[str, Any]:
+        p = self._seen_path()
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_seen(self, seen: Dict[str, Any]) -> None:
+        seen.setdefault("event", os.environ.get("CTFD_EVENT") or self._derive_event_slug())
+        seen.setdefault("host", self.host)
+        seen["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            self._seen_path().write_text(
+                json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def _diff_new_challenges(self, chals: List[Dict[str, Any]]) -> None:
+        ids_now = {int(c["id"]) for c in chals if c.get("id") is not None}
+        seen = self._load_seen()
+        if not seen:
+            # Первый вызов: seed baseline молча.
+            seen["ids"] = sorted(ids_now)
+            self._save_seen(seen)
+            print(
+                f"[ctfd] seeded .seen.json: {len(ids_now)} challenges baselined",
+                file=sys.stderr,
+            )
+            return
+        known = set(seen.get("ids") or [])
+        new_ids = sorted(ids_now - known)
+        if not new_ids:
+            return
+        by_id = {int(c["id"]): c for c in chals}
+        print(
+            f"[ctfd] {len(new_ids)} NEW challenge(s) since "
+            f"{seen.get('updated_at', '?')}:",
+            file=sys.stderr,
+        )
+        for cid in new_ids:
+            c = by_id.get(cid, {})
+            print(
+                f"  [new] #{cid} \"{c.get('name', '?')}\" "
+                f"({c.get('category', '?')}, {c.get('value', '?')}pt) "
+                f"— solves={c.get('solves', 0)}",
+                file=sys.stderr,
+            )
+        seen["ids"] = sorted(ids_now)
+        self._save_seen(seen)
+
+    @staticmethod
+    def _classify_notification(title: str, body: str) -> str:
+        text = f"{title} {body}".lower()
+        for tag, keywords in _NOTIFY_KEYWORDS:
+            if any(k in text for k in keywords):
+                return tag
+        return "general"
+
+    def _poll_notifications(self) -> None:
+        seen = self._load_seen()
+        since = seen.get("last_notification_id")
+        # На первом опросе (cursor не задан) — показать ВСЕ существующие
+        # анонсы один раз (включая исторические подсказки/уточнения), затем
+        # ставить курсор на max(id). Дальше — только новые.
+        params = {"since_id": since} if since else None
+        try:
+            notes = self._request("GET", "/notifications", params=params) or []
+        except CTfdError:
+            return
+        if not notes:
+            return
+        for n in notes:
+            nid = n.get("id")
+            title = (n.get("title") or "").strip()
+            body = (n.get("body") or "").strip().replace("\n", " ")
+            if len(body) > 160:
+                body = body[:157] + "..."
+            tag = self._classify_notification(title, body)
+            line = f"[ctfd] NOTIFY #{nid} [{tag}]"
+            if title:
+                line += f" {title}"
+            line += f": {body}" if body else ""
+            print(line.rstrip(), file=sys.stderr)
+        max_id = max(
+            (n.get("id") for n in notes if n.get("id") is not None),
+            default=None,
+        )
+        if max_id is not None:
+            seen["last_notification_id"] = max_id
+            seen.setdefault("ids", [])
+            self._save_seen(seen)
+
+    # ------------------------------------------------------------------
+    #  Авто-лог сабмитов + маркировка solved в challenge.yaml
+    # ------------------------------------------------------------------
+    def _autolog_attempt(
+        self,
+        challenge_id: int,
+        submission: str,
+        verdict_data: Dict[str, Any],
+    ) -> None:
+        """Best-effort запись попытки в NOTES.md + solved:true при корректе.
+
+        Любая ошибка подавляется — журналирование НИКОГДА не блокирует сабмит.
+        """
+        try:
+            status = verdict_data.get("status", "unknown")
+            message = verdict_data.get("message", "")
+            tag = _STATUS_LOG.get(status, "tried")
+            preview = submission if len(submission) <= 80 else submission[:77] + "..."
+            entry = f"submit `{preview}` -> {status}: {message}"
+            ws = self._active_ws or self._find_workspace_by_id(challenge_id)
+            if ws is None:
+                return  # без воркспейса логировать некуда — тихо
+            self._active_ws = ws
+            notes = ws / "NOTES.md"
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+            with open(notes, "a", encoding="utf-8") as fh:
+                fh.write(f"## [{ts}] {tag}\n{entry}\n\n")
+            if status in ("correct", "already_solved"):
+                self._mark_solved_in_yaml(ws, True)
+        except Exception:
+            pass
+
+    def _mark_solved_in_yaml(self, ws: Path, solved: bool) -> None:
+        yf = ws / "challenge.yaml"
+        if not yf.exists():
+            return
+        try:
+            meta = json.loads(yf.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        meta["solved"] = bool(solved)
+        meta["solved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S") if solved else None
+        try:
+            yf.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    #  Сводка по воркспейсам + сверка/синхронизация с сервером
+    # ------------------------------------------------------------------
+    def workspace_status(
+        self,
+        event: Optional[str] = None,
+        base: str = "~/Downloads/ctf",
+    ) -> Dict[str, Any]:
+        """Локальная сводка по воркспейсам события + сверка с сервером.
+
+        Сканирует ``<base>/<event>/**/challenge.yaml``, считает solved /
+        in_progress и сверяет множество решённых с ``my_solves()`` — ловит
+        дрейф вида «локально 22, сервер 25». Без токена работает оффлайн
+        (поля server_* остаются пустыми).
+        """
+        base_path = Path(os.path.expanduser(base))
+        event = event or os.environ.get("CTFD_EVENT") or self._derive_event_slug()
+        root = base_path / event
+        local: List[Dict[str, Any]] = []
+        if root.exists():
+            for yf in root.rglob("challenge.yaml"):
+                try:
+                    local.append(json.loads(yf.read_text(encoding="utf-8")))
+                except Exception:
+                    continue
+        solved_local = [m for m in local if m.get("solved")]
+        in_progress = [m for m in local if not m.get("solved")]
+        server_solved_ids: List[int] = []
+        drift: List[int] = []
+        try:
+            server_solves = self.my_solves() or []
+            server_solved_ids = sorted(
+                {int(s["challenge_id"]) for s in server_solves if s.get("challenge_id")}
+            )
+            local_ids = {int(m["id"]) for m in local if m.get("id") is not None}
+            drift = sorted(set(server_solved_ids) - local_ids)
+        except Exception:
+            pass
+        return {
+            "event": event,
+            "root": str(root),
+            "total_local": len(local),
+            "solved_local": len(solved_local),
+            "in_progress": len(in_progress),
+            "server_solved": len(server_solved_ids),
+            "drift_untracked_solves": drift,
+        }
+
+    def sync_from_server(
+        self,
+        event: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Дозаполнить воркспейсы из серверной истины.
+
+        Для каждого решённого на сервере челленджа без локального
+        ``challenge.yaml`` (или с ``solved: false``) — создаёт/обновляет
+        scaffold через ``init_challenge_workspace`` и выставляет ``solved: true``.
+        Возвращает ``{created, updated, skipped, errors}``.
+        """
+        result: Dict[str, Any] = {
+            "created": [],
+            "updated": [],
+            "skipped": [],
+            "errors": [],
+            "dry_run": dry_run,
+        }
+        try:
+            server_solves = self.my_solves() or []
+        except Exception as e:
+            result["errors"].append(f"my_solves failed: {e}")
+            return result
+        solved_ids = sorted(
+            {int(s["challenge_id"]) for s in server_solves if s.get("challenge_id")}
+        )
+        for cid in solved_ids:
+            try:
+                ws = self._find_workspace_by_id(cid)
+                if ws is None:
+                    if dry_run:
+                        result["created"].append(cid)
+                        continue
+                    detail = self.get_challenge(cid)
+                    ws = self.init_challenge_workspace(detail)
+                    self._mark_solved_in_yaml(ws, True)
+                    self.log_attempt(cid, "synced from server: solved", "solved")
+                    result["created"].append(cid)
+                else:
+                    try:
+                        meta = json.loads((ws / "challenge.yaml").read_text(encoding="utf-8"))
+                    except Exception:
+                        meta = {}
+                    if meta.get("solved"):
+                        result["skipped"].append(cid)
+                    else:
+                        if dry_run:
+                            result["updated"].append(cid)
+                            continue
+                        self._mark_solved_in_yaml(ws, True)
+                        result["updated"].append(cid)
+            except Exception as e:
+                result["errors"].append(f"#{cid}: {e}")
+        return result
+
     # -- управление собственными API-токенами --------------------------
     def generate_token(
         self,
@@ -565,17 +890,17 @@ class CTfdClient:
 # ====================================================================
 #  CLI
 # ====================================================================
-def _client_from_args(args: argparse.Namespace) -> CTfdClient:
+def _client_from_args(args: argparse.Namespace, allow_no_token: bool = False) -> CTfdClient:
     host = args.host or os.environ.get(CTFD_HOST_ENV)
     token = args.token or os.environ.get(CTFD_TOKEN_ENV)
     if not host:
         sys.exit(f"ошибка: требуется --host или ${CTFD_HOST_ENV}")
-    if not token:
+    if not token and not allow_no_token:
         sys.exit(
             f"ошибка: требуется --token или ${CTFD_TOKEN_ENV} "
             "(логин по паролю в CLI не поддерживается)"
         )
-    return CTfdClient(host, token=token)
+    return CTfdClient(host, token=token or None)
 
 
 def _print(obj: Any) -> None:
@@ -628,13 +953,28 @@ def _build_parser() -> argparse.ArgumentParser:
     gt.add_argument("--description")
     rt = sub.add_parser("revoke-token", help="Отозвать токен по id")
     rt.add_argument("id", type=int)
+
+    st = sub.add_parser(
+        "status",
+        help="Сводка по воркспейсам события + сверка решённых с сервером",
+    )
+    st.add_argument("--event", help="slug события (по умолчанию выводится из host)")
+    st.add_argument("--base", default="~/Downloads/ctf", help="база воркспейсов")
+
+    sy = sub.add_parser(
+        "sync",
+        help="Дозаполнить challenge.yaml/description.md из сервера (по my_solves)",
+    )
+    sy.add_argument("--event", help="slug события")
+    sy.add_argument("--dry-run", action="store_true", help="только показать, не записывая")
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
-    c = _client_from_args(args)
     cmd = args.cmd
+    # status работает оффлайн (без токена) — только локальная сводка, без сверки.
+    c = _client_from_args(args, allow_no_token=(cmd == "status"))
 
     if cmd == "challenges":
         flt = {"category": args.category} if args.category else None
@@ -666,6 +1006,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif cmd == "revoke-token":
         c.revoke_token(args.id)
         _print({"revoked": args.id})
+    elif cmd == "status":
+        _print(c.workspace_status(event=args.event, base=args.base))
+    elif cmd == "sync":
+        _print(c.sync_from_server(event=args.event, dry_run=args.dry_run))
     return 0
 
 
