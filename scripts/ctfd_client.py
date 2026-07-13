@@ -93,6 +93,10 @@ class RateLimited(CTfdError):
 class CTfdClient:
     """Клиент player-эндпоинтов инстанса CTFd."""
 
+    # Сколько исторических анонсов печатать при первом опросе notifications
+    # (когда курсора ещё нет). Перекрыть per-instance: c._notifications_first_limit = N.
+    _notifications_first_limit: int = 50
+
     def __init__(
         self,
         host: str,
@@ -767,14 +771,27 @@ class CTfdClient:
         курсор на max(id). Дальше — только новые.
         """
         since = seen.get("last_notification_id")
+        first_run = since is None
         params = {"since_id": since} if since else None
         try:
             notes = self._request("GET", "/notifications", params=params) or []
-        except CTfdError:
+        except CTfdError as e:
+            print(f"[ctfd] notifications poll failed: {e}", file=sys.stderr)
             return seen
         if not notes:
             return seen
-        for n in notes:
+        to_show = notes
+        if first_run and len(notes) > self._notifications_first_limit:
+            # CTFd возвращает asc по id → последние = самые свежие.
+            to_show = notes[-self._notifications_first_limit:]
+            print(
+                f"[ctfd] first notifications poll: {len(notes)} historical, "
+                f"showing newest {len(to_show)} "
+                f"({len(notes) - len(to_show)} older omitted — "
+                f"`python scripts/ctfd_client.py notifications` to page)",
+                file=sys.stderr,
+            )
+        for n in to_show:
             nid = n.get("id")
             title = (n.get("title") or "").strip()
             body = (n.get("body") or "").strip().replace("\n", " ")
@@ -868,16 +885,29 @@ class CTfdClient:
         solved_local = [m for m in local if m.get("solved")]
         in_progress = [m for m in local if not m.get("solved")]
         server_solved_ids: List[int] = []
+        server_set: set = set()
         drift: List[int] = []
+        local_unsolved_server_solved: List[int] = []
         try:
             server_solves = self.my_solves() or []
             server_solved_ids = sorted(
                 {int(s["challenge_id"]) for s in server_solves if s.get("challenge_id")}
             )
+            server_set = set(server_solved_ids)
             local_ids = {int(m["id"]) for m in local if m.get("id") is not None}
-            drift = sorted(set(server_solved_ids) - local_ids)
-        except Exception:
-            pass
+            drift = sorted(server_set - local_ids)
+            # воркспейс есть, но локально solved:false, а сервер говорит решено —
+            # sync это починил бы; показываем отдельно от drift.
+            local_unsolved_server_solved = sorted(
+                int(m["id"]) for m in local
+                if m.get("id") is not None and not m.get("solved")
+                and int(m["id"]) in server_set
+            )
+        except Exception as e:
+            print(
+                f"[ctfd] status: my_solves() failed ({e}) — server fields empty",
+                file=sys.stderr,
+            )
         return {
             "event": event,
             "root": str(root),
@@ -886,19 +916,24 @@ class CTfdClient:
             "in_progress": len(in_progress),
             "server_solved": len(server_solved_ids),
             "drift_untracked_solves": drift,
+            "local_unsolved_server_solved": local_unsolved_server_solved,
         }
 
     def sync_from_server(
         self,
         event: Optional[str] = None,
         dry_run: bool = False,
+        all_challenges: bool = False,
     ) -> Dict[str, Any]:
         """Дозаполнить воркспейсы из серверной истины.
 
-        Для каждого решённого на сервере челленджа без локального воркспейса
-        (или с ``solved: false``) — создаёт/обновляет scaffold через
-        ``init_challenge_workspace`` и выставляет ``solved: true``.
-        Возвращает ``{created, updated, skipped, errors}``.
+        По умолчанию (``all_challenges=False``) обрабатывает только решённые на
+        сервере (``my_solves``): для каждого без локального воркспейса (или с
+        ``solved: false``) создаёт/обновляет scaffold и выставляет ``solved: true``.
+
+        При ``all_challenges=True`` scaffодит ВСЕ задачи без локального
+        воркспейса (без авто-``solved``) — удобно для pre-populate в начале
+        ивента. Возвращает ``{created, updated, skipped, errors}``.
         """
         result: Dict[str, Any] = {
             "created": [],
@@ -907,6 +942,31 @@ class CTfdClient:
             "errors": [],
             "dry_run": dry_run,
         }
+        if all_challenges:
+            try:
+                chals = self.list_challenges(
+                    update_seen=False, poll_notifications=False
+                ) or []
+            except Exception as e:
+                result["errors"].append(f"list_challenges failed: {e}")
+                return result
+            for ch in chals:
+                cid = ch.get("id")
+                if cid is None:
+                    continue
+                try:
+                    if self._find_workspace_by_id(cid) is not None:
+                        result["skipped"].append(cid)
+                        continue
+                    if dry_run:
+                        result["created"].append(cid)
+                        continue
+                    detail = self.get_challenge(cid)
+                    self.init_challenge_workspace(detail)
+                    result["created"].append(cid)
+                except Exception as e:
+                    result["errors"].append(f"#{cid}: {e}")
+            return result
         try:
             server_solves = self.my_solves() or []
         except Exception as e:
@@ -1038,10 +1098,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sy = sub.add_parser(
         "sync",
-        help="Дозаполнить challenge.yaml/description.md из сервера (по my_solves)",
+        help="Дозаполнить challenge.json/description.md из сервера (по my_solves)",
     )
     sy.add_argument("--event", help="slug события")
     sy.add_argument("--dry-run", action="store_true", help="только показать, не записывая")
+    sy.add_argument(
+        "--all",
+        action="store_true",
+        help="scaffодить ВСЕ задачи без локального воркспейса (не только решённые)",
+    )
+
+    dc = sub.add_parser(
+        "download-challenge",
+        help="Скаффолдить воркспейс задачи и скачать все её файлы в attachments/",
+    )
+    dc.add_argument("id", type=int)
     return p
 
 
@@ -1084,7 +1155,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif cmd == "status":
         _print(c.workspace_status(event=args.event, base=args.base))
     elif cmd == "sync":
-        _print(c.sync_from_server(event=args.event, dry_run=args.dry_run))
+        _print(c.sync_from_server(
+            event=args.event, dry_run=args.dry_run, all_challenges=args.all
+        ))
+    elif cmd == "download-challenge":
+        detail = c.get_challenge(args.id)
+        ws = c.init_challenge_workspace(detail)
+        files = detail.get("files") or []
+        paths = [str(c.download_file(f)) for f in files]
+        _print({"workspace": str(ws), "files": len(files), "downloaded": paths})
     return 0
 
 
