@@ -73,6 +73,10 @@ _NOTIFY_KEYWORDS = [
                  "penalt", "штраф")),
 ]
 
+# Файлы метаданных воркспейса. Приоритет чтения — слева направо; при записи
+# challenge.json старый challenge.yaml удаляется (миграция).
+_META_FILES = ("challenge.json", "challenge.yaml")
+
 
 class CTfdError(Exception):
     """Базовая ошибка клиента CTFd."""
@@ -345,10 +349,17 @@ class CTfdClient:
         «тихого» обзора (без записи состояния).
         """
         data = self._request("GET", "/challenges", params=filters or None)
-        if update_seen:
-            self._diff_new_challenges(data)
-        if poll_notifications:
-            self._poll_notifications()
+        if update_seen or poll_notifications:
+            # Одна загрузка и одно сохранение .seen.json на вызов (раньше
+            # _diff_new_challenges и _poll_notifications сохраняли каждый).
+            seen = self._load_seen()
+            if update_seen:
+                seen = self._diff_new_challenges(
+                    data, filtered=bool(filters), seen=seen
+                )
+            if poll_notifications:
+                seen = self._poll_notifications(seen)
+            self._save_seen(seen)
         return data
 
     def get_challenge(self, challenge_id: int) -> Dict[str, Any]:
@@ -510,7 +521,13 @@ class CTfdClient:
         (ws / "attachments").mkdir(parents=True, exist_ok=True)
         (ws / "scripts").mkdir(parents=True, exist_ok=True)
 
-        meta = {
+        # Idempotency: сохраняем состояние решения существующего воркспейса.
+        existing = self._read_meta(ws)
+        created_at = existing.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S")
+        # solved никогда не регрессируем. Серверный solved_by_me поднимает в True,
+        # но уже проставленный локально (autolog) не сбрасываем устаревшим detail.
+        solved = bool(existing.get("solved")) or bool(challenge.get("solved_by_me"))
+        meta: Dict[str, Any] = {
             "id": challenge.get("id"),
             "name": challenge.get("name"),
             "category": challenge.get("category"),
@@ -518,16 +535,18 @@ class CTfdClient:
             "connection_info": challenge.get("connection_info"),
             "host": self.host,
             "event": event,
-            "solved": bool(challenge.get("solved_by_me")),
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "solved": solved,
+            "created_at": created_at,
             "workspace": str(ws),
         }
-        (ws / "challenge.yaml").write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        (ws / "description.md").write_text(
-            challenge.get("description") or "(описание отсутствует)", encoding="utf-8"
-        )
+        if solved and existing.get("solved_at"):
+            meta["solved_at"] = existing["solved_at"]
+        self._write_meta(ws, meta)  # пишет challenge.json, мигрирует старый .yaml
+        desc = ws / "description.md"
+        if not desc.exists():
+            desc.write_text(
+                challenge.get("description") or "(описание отсутствует)", encoding="utf-8"
+            )
         notes = ws / "NOTES.md"
         if not notes.exists():
             notes.write_text(
@@ -546,21 +565,25 @@ class CTfdClient:
         challenge_id: int,
         entry: str,
         status: Optional[str] = None,
+        *,
+        _silent: bool = False,
     ) -> Path:
         """Дописать датированную запись в ``NOTES.md`` задачи.
 
         ``status`` — короткая метка (``'hypothesis'``/``'tried'``/``'solved'``/
         ``'failed'``/...). Если активный воркспейс не задан, ищется по
-        ``challenge_id`` в ``challenge.yaml``; если не найден — запись теряется
-        с предупреждением в stderr.
+        ``challenge_id`` в метаданных воркспейса; если не найден — запись
+        теряется с предупреждением в stderr (если не ``_silent`` — используется
+        авто-логом :meth:`_autolog_attempt`, чтобы не шуметь без воркспейса).
         """
         ws = self._active_ws or self._find_workspace_by_id(challenge_id)
         if ws is None:
-            print(
-                f"[ctfd] log_attempt: воркспейс для challenge {challenge_id} "
-                f"не найден — запись потеряна",
-                file=sys.stderr,
-            )
+            if not _silent:
+                print(
+                    f"[ctfd] log_attempt: воркспейс для challenge {challenge_id} "
+                    f"не найден — запись потеряна",
+                    file=sys.stderr,
+                )
             return Path()
         self._active_ws = ws
         notes = ws / "NOTES.md"
@@ -575,6 +598,36 @@ class CTfdClient:
         """lowercase; не-буквы/цифры → ``_``; коллапс повторов; trim."""
         s = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
         return s or "challenge"
+
+    # -- чтение/запись метаданных воркспейса (challenge.json, с миграцией .yaml) -
+    @staticmethod
+    def _read_meta(ws: Path) -> Dict[str, Any]:
+        """Прочитать метаданные воркспейса. Приоритет: challenge.json, затем
+        устаревший challenge.yaml. Возвращает ``{}`` если ничего нет."""
+        for name in _META_FILES:
+            mf = ws / name
+            if mf.exists():
+                try:
+                    return json.loads(mf.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+        return {}
+
+    @staticmethod
+    def _write_meta(ws: Path, meta: Dict[str, Any]) -> None:
+        """Записать challenge.json и удалить старый challenge.yaml (миграция)."""
+        try:
+            (ws / "challenge.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            return
+        yf = ws / "challenge.yaml"
+        if yf.exists():
+            try:
+                yf.unlink()
+            except OSError:
+                pass
 
     def _derive_event_slug(self) -> str:
         """event-слаг из host: ``nhnc.ic3dt3a.org`` → ``nhnc-YYYY``.
@@ -594,17 +647,25 @@ class CTfdClient:
         return f"{cand}-{time.strftime('%Y')}"
 
     def _find_workspace_by_id(self, challenge_id: int) -> Optional[Path]:
-        """Найти воркспейс по ``id`` в ``challenge.yaml`` под базовой папкой."""
+        """Найти воркспейс по ``id`` в метаданных под папкой ТЕКУЩЕГО события.
+
+        Scope ограничен ``~/Downloads/ctf/<event>/`` — CTFd-ные id per-instance
+        (1..N), поэтому без фильтра по event два события с одинаковым id
+        коллидировали бы (недетерминированный возврат первого попавшего).
+        """
         base = Path(os.path.expanduser("~/Downloads/ctf"))
-        if not base.exists():
+        event = os.environ.get("CTFD_EVENT") or self._derive_event_slug()
+        root = base / event
+        if not root.exists():
             return None
-        for yaml_file in base.rglob("challenge.yaml"):
-            try:
-                meta = json.loads(yaml_file.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if meta.get("id") == challenge_id:
-                return yaml_file.parent
+        for name in _META_FILES:
+            for mf in root.rglob(name):
+                try:
+                    meta = json.loads(mf.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if meta.get("id") == challenge_id:
+                    return mf.parent
         return None
 
     # ------------------------------------------------------------------
@@ -640,38 +701,55 @@ class CTfdClient:
         except OSError:
             pass
 
-    def _diff_new_challenges(self, chals: List[Dict[str, Any]]) -> None:
+    def _diff_new_challenges(
+        self,
+        chals: List[Dict[str, Any]],
+        *,
+        filtered: bool,
+        seen: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Обновить ``seen`` (in-place + return) списком текущих id.
+
+        Корректность при фильтре: ``ids`` хранится как **union** (когда-либо
+        виденные), никогда не перезаписывается подмножеством отфильтрованного
+        вызова. ``baselined`` фиксирует, что был полный (без фильтров) обзор —
+        до этого «новые» не анонсируются (baseline ещё неполный).
+        """
         ids_now = {int(c["id"]) for c in chals if c.get("id") is not None}
-        seen = self._load_seen()
-        if not seen:
-            # Первый вызов: seed baseline молча.
-            seen["ids"] = sorted(ids_now)
-            self._save_seen(seen)
-            print(
-                f"[ctfd] seeded .seen.json: {len(ids_now)} challenges baselined",
-                file=sys.stderr,
-            )
-            return
         known = set(seen.get("ids") or [])
+        seen["ids"] = sorted(ids_now | known)
+        if not seen.get("baselined"):
+            if not filtered:
+                seen["baselined"] = True
+                print(
+                    f"[ctfd] seeded .seen.json: {len(ids_now)} challenges baselined",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "[ctfd] NOTE: list_challenges() с фильтром до baseline — "
+                    "детект новых задач отключён. Вызовите list_challenges() "
+                    "без фильтров для полного seed.",
+                    file=sys.stderr,
+                )
+            return seen
         new_ids = sorted(ids_now - known)
-        if not new_ids:
-            return
-        by_id = {int(c["id"]): c for c in chals}
-        print(
-            f"[ctfd] {len(new_ids)} NEW challenge(s) since "
-            f"{seen.get('updated_at', '?')}:",
-            file=sys.stderr,
-        )
-        for cid in new_ids:
-            c = by_id.get(cid, {})
+        if new_ids:
+            by_id = {int(c["id"]): c for c in chals}
             print(
-                f"  [new] #{cid} \"{c.get('name', '?')}\" "
-                f"({c.get('category', '?')}, {c.get('value', '?')}pt) "
-                f"— solves={c.get('solves', 0)}",
+                f"[ctfd] {len(new_ids)} NEW challenge(s) since "
+                f"{seen.get('updated_at', '?')}:",
                 file=sys.stderr,
             )
-        seen["ids"] = sorted(ids_now)
-        self._save_seen(seen)
+            for cid in new_ids:
+                c = by_id.get(cid, {})
+                print(
+                    f"  [new] #{cid} \"{c.get('name', '?')}\" "
+                    f"({c.get('category', '?')}, {c.get('value', '?')}pt) "
+                    f"— solves={c.get('solves', 0)}",
+                    file=sys.stderr,
+                )
+        return seen
 
     @staticmethod
     def _classify_notification(title: str, body: str) -> str:
@@ -681,19 +759,21 @@ class CTfdClient:
                 return tag
         return "general"
 
-    def _poll_notifications(self) -> None:
-        seen = self._load_seen()
+    def _poll_notifications(self, seen: Dict[str, Any]) -> Dict[str, Any]:
+        """Обновить ``seen`` (in-place + return) новыми анонсами.
+
+        На первом опросе (cursor не задан) показывает все существующие анонсы
+        один раз (включая исторические подсказки/уточнения), затем ставит
+        курсор на max(id). Дальше — только новые.
+        """
         since = seen.get("last_notification_id")
-        # На первом опросе (cursor не задан) — показать ВСЕ существующие
-        # анонсы один раз (включая исторические подсказки/уточнения), затем
-        # ставить курсор на max(id). Дальше — только новые.
         params = {"since_id": since} if since else None
         try:
             notes = self._request("GET", "/notifications", params=params) or []
         except CTfdError:
-            return
+            return seen
         if not notes:
-            return
+            return seen
         for n in notes:
             nid = n.get("id")
             title = (n.get("title") or "").strip()
@@ -713,10 +793,10 @@ class CTfdClient:
         if max_id is not None:
             seen["last_notification_id"] = max_id
             seen.setdefault("ids", [])
-            self._save_seen(seen)
+        return seen
 
     # ------------------------------------------------------------------
-    #  Авто-лог сабмитов + маркировка solved в challenge.yaml
+    #  Авто-лог сабмитов + маркировка solved в метаданных воркспейса
     # ------------------------------------------------------------------
     def _autolog_attempt(
         self,
@@ -727,40 +807,33 @@ class CTfdClient:
         """Best-effort запись попытки в NOTES.md + solved:true при корректе.
 
         Любая ошибка подавляется — журналирование НИКОГДА не блокирует сабмит.
+        Делегирует запись в :meth:`log_attempt` (``_silent=True``), чтобы формат
+        журнала был определён в одном месте.
         """
         try:
             status = verdict_data.get("status", "unknown")
             message = verdict_data.get("message", "")
             tag = _STATUS_LOG.get(status, "tried")
             preview = submission if len(submission) <= 80 else submission[:77] + "..."
-            entry = f"submit `{preview}` -> {status}: {message}"
-            ws = self._active_ws or self._find_workspace_by_id(challenge_id)
-            if ws is None:
-                return  # без воркспейса логировать некуда — тихо
-            self._active_ws = ws
-            notes = ws / "NOTES.md"
-            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-            with open(notes, "a", encoding="utf-8") as fh:
-                fh.write(f"## [{ts}] {tag}\n{entry}\n\n")
+            self.log_attempt(
+                challenge_id, f"submit `{preview}` -> {status}: {message}", tag,
+                _silent=True,
+            )
             if status in ("correct", "already_solved"):
-                self._mark_solved_in_yaml(ws, True)
+                ws = self._active_ws or self._find_workspace_by_id(challenge_id)
+                if ws is not None:
+                    self._mark_solved_meta(ws, True)
         except Exception:
             pass
 
-    def _mark_solved_in_yaml(self, ws: Path, solved: bool) -> None:
-        yf = ws / "challenge.yaml"
-        if not yf.exists():
-            return
-        try:
-            meta = json.loads(yf.read_text(encoding="utf-8"))
-        except Exception:
+    def _mark_solved_meta(self, ws: Path, solved: bool) -> None:
+        """Поставить/снять ``solved`` (+ ``solved_at``) в challenge.json."""
+        meta = self._read_meta(ws)
+        if not meta:
             return
         meta["solved"] = bool(solved)
         meta["solved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S") if solved else None
-        try:
-            yf.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        self._write_meta(ws, meta)
 
     # ------------------------------------------------------------------
     #  Сводка по воркспейсам + сверка/синхронизация с сервером
@@ -772,9 +845,9 @@ class CTfdClient:
     ) -> Dict[str, Any]:
         """Локальная сводка по воркспейсам события + сверка с сервером.
 
-        Сканирует ``<base>/<event>/**/challenge.yaml``, считает solved /
-        in_progress и сверяет множество решённых с ``my_solves()`` — ловит
-        дрейф вида «локально 22, сервер 25». Без токена работает оффлайн
+        Сканирует ``<base>/<event>/**/{challenge.json,challenge.yaml}``, считает
+        solved / in_progress и сверяет множество решённых с ``my_solves()`` —
+        ловит дрейф вида «локально 22, сервер 25». Без токена работает оффлайн
         (поля server_* остаются пустыми).
         """
         base_path = Path(os.path.expanduser(base))
@@ -782,11 +855,16 @@ class CTfdClient:
         root = base_path / event
         local: List[Dict[str, Any]] = []
         if root.exists():
-            for yf in root.rglob("challenge.yaml"):
-                try:
-                    local.append(json.loads(yf.read_text(encoding="utf-8")))
-                except Exception:
-                    continue
+            seen_dirs: set = set()
+            for name in _META_FILES:
+                for mf in root.rglob(name):
+                    wd = mf.parent
+                    if wd in seen_dirs:
+                        continue
+                    meta = self._read_meta(wd)
+                    if meta:
+                        local.append(meta)
+                        seen_dirs.add(wd)
         solved_local = [m for m in local if m.get("solved")]
         in_progress = [m for m in local if not m.get("solved")]
         server_solved_ids: List[int] = []
@@ -817,9 +895,9 @@ class CTfdClient:
     ) -> Dict[str, Any]:
         """Дозаполнить воркспейсы из серверной истины.
 
-        Для каждого решённого на сервере челленджа без локального
-        ``challenge.yaml`` (или с ``solved: false``) — создаёт/обновляет
-        scaffold через ``init_challenge_workspace`` и выставляет ``solved: true``.
+        Для каждого решённого на сервере челленджа без локального воркспейса
+        (или с ``solved: false``) — создаёт/обновляет scaffold через
+        ``init_challenge_workspace`` и выставляет ``solved: true``.
         Возвращает ``{created, updated, skipped, errors}``.
         """
         result: Dict[str, Any] = {
@@ -846,21 +924,18 @@ class CTfdClient:
                         continue
                     detail = self.get_challenge(cid)
                     ws = self.init_challenge_workspace(detail)
-                    self._mark_solved_in_yaml(ws, True)
+                    self._mark_solved_meta(ws, True)
                     self.log_attempt(cid, "synced from server: solved", "solved")
                     result["created"].append(cid)
                 else:
-                    try:
-                        meta = json.loads((ws / "challenge.yaml").read_text(encoding="utf-8"))
-                    except Exception:
-                        meta = {}
+                    meta = self._read_meta(ws)
                     if meta.get("solved"):
                         result["skipped"].append(cid)
                     else:
                         if dry_run:
                             result["updated"].append(cid)
                             continue
-                        self._mark_solved_in_yaml(ws, True)
+                        self._mark_solved_meta(ws, True)
                         result["updated"].append(cid)
             except Exception as e:
                 result["errors"].append(f"#{cid}: {e}")
