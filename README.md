@@ -14,6 +14,16 @@ REST-интерфейс (`/api/v1`). Помогает участвовать в 
 - Список и детальный просмотр челленджей (категории, баллы, число солвов, «решил ли я»)
 - **Подача флагов** с обработкой всех вариантов ответа
   (`correct` / `incorrect` / `already_solved` / `partial` / `ratelimited` / …)
+- **Авто-фиксация солвов**: `attempt()` сам дописывает результат в `NOTES.md`
+  задачи и при `correct` ставит `solved: true` в `challenge.yaml` — счётчик
+  решённых больше не разъезжается с сервером (регрессия BroncoCTF 2026:
+  локально 22 vs сервер 25)
+- **Обнаружение новых задач и анонсов**: `list_challenges()` автоматически
+  diff'ит новые задачи против снапшота `.seen.json` и сливает подсказки/
+  уточнения из `/notifications` (с тегом `hint`/`clarification`/`new`/...)
+  в stderr — организаторы публикуют задачи и постят подсказки по ходу ивента
+- **Сверка с сервером**: CLI `status` (ловит дрейф солвов, оффлайн без токена)
+  и `sync` (дозаполняет `challenge.yaml`/`description.md` из `my_solves`)
 - Автоматический backoff при `429` (антибрутфорс CTFd) — клиент сам читает
   число секунд ожидания из ответа и делает один повтор
 - Скачивание приложенных файлов по уже подписанным URL
@@ -144,6 +154,9 @@ python scripts/ctfd_client.py notifications --since-id 5 --host "$CTFD_HOST" --t
 python scripts/ctfd_client.py gen-token --description "automation" --expiration 2026-12-31
 python scripts/ctfd_client.py tokens
 python scripts/ctfd_client.py revoke-token 3
+python scripts/ctfd_client.py status          # сводка по воркспейсам + сверка с my_solves (оффлайн без --token)
+python scripts/ctfd_client.py sync --dry-run  # превью дозаполнения из сервера
+python scripts/ctfd_client.py sync            # создать/обновить challenge.yaml для серверных солвов
 ```
 
 Демо end-to-end сценария (только чтение по умолчанию):
@@ -175,9 +188,16 @@ python examples/solve_flow.py --submit-id 42 --flag 'BugCTF{...}'
 - `<event>` выводится из host инстанса (`nhnc.ic3dt3a.org` → `nhnc-2026`);
   override через env `CTFD_EVENT`.
 - `init_challenge_workspace(detail)` создаёт scaffold + `description.md` + заголовок `NOTES.md`.
-- `download_file(f)` без `dest_dir` складывает файлы в `attachments/`.
+- `download_file(f)` без `dest_dir` складывает файлы в `attachments/`. Без
+  активного воркспейса ругнётся в stderr и сохранит в `/tmp` (футган, не норма).
 - `log_attempt(challenge_id, entry, status)` дописывает датированную запись в
   `NOTES.md` (`status`: `hypothesis` / `tried` / `solved` / `failed`).
+- `attempt()` **автоматически** логирует вердикт и при `correct`/`already_solved`
+  ставит `solved: true` в `challenge.yaml` — ручной `log_attempt` для самого
+  флага не нужен, только для промежуточных шагов.
+- `list_challenges()` **автоматически** детектит новые задачи (diff против
+  `.seen.json`) и новые анонсы из `/notifications` (с тегом классификации).
+  Состояние события хранится в `~/Downloads/ctf/<event>/.seen.json`.
 
 Эпемерный scratch (разовые `curl`-пробы, распакованные бинарники) по-прежнему
 идёт в `/tmp`. Самописные скрипты — в `scripts/` воркспейса.

@@ -44,6 +44,48 @@ CSRF nonce must be carried as the `CSRF-Token: <nonce>` header on every
 state-changing request. Use `CTfdClient.from_userpass(...)` which does all of
 this. Token auth is simpler — prefer it whenever possible.
 
+## 0a. Обязательный чек-лист воркспейса (НЕ ПРОПУСКАТЬ)
+
+Регрессия на BroncoCTF 2026: скилл был установлен, но `init_challenge_workspace`
+/ `log_attempt` ни разу не вызвались за весь уикенд — файлы сливались через
+сырой `curl` в ad-hoc папки по имени категории, единый общий `NOTES.md` вёл
+счётчик солвов с дрейфом (22 локально vs 25 на сервере), solve-скрипты
+терялись. Этот чек-лист — обязательный порядок действий на каждую задачу.
+
+**На каждое касание задачи ОБЯЗАТЕЛЬНО:**
+
+1. **Первое касание** — `ws = ctfd.init_challenge_workspace(detail)` ДО любого
+   скачивания/анализа. Никаких `curl`/`wget` в папки по имени категории.
+2. **Каждый файл задачи** — через `ctfd.download_file(f)` (положит в
+   `ws/attachments/`). `download_file` без активного воркспейса ругнётся в
+   stderr и сохранит в `/tmp` — это футган, не норма.
+3. **Каждый solve-скрипт / эксплойт** — писать в `ws/scripts/` и запускать
+   оттуда (`cd <ws>/scripts`). Эфемерный scratch (распакованные бинарники под
+   RE, разовые `curl`-пробы) — в `/tmp`, но авторский код — в `scripts/`.
+4. **Каждая гипотеза / запуск тулзы / попытка** —
+   `ctfd.log_attempt(id, text, status)`. Флаг-солв логируется автоматически
+   (см. §3a) — на это не полагаться для промежуточных шагов.
+5. **Перед взятием новой задачи** — `ctfd.list_challenges()`: единая точка
+   «что нового» — автоматически diff'ит новые задачи против снапшота
+   `~/Downloads/ctf/<event>/.seen.json` и сливает новые анонсы из
+   `/notifications` (подсказки/уточнения организаторов) с тегом классификации.
+   Организаторы публикуют задачи и постят подсказки по ходу ивента.
+6. **Возобновление сессии** (новый запуск / после компактизации контекста) —
+   перечитать `ws/NOTES.md` активной задачи; periodically сверяться через
+   `python scripts/ctfd_client.py status` (ловит дрейф солвов vs сервер).
+
+**АНТИПАТТЕРНЫ** (ровно то, что привело к регрессии — НЕ повторять):
+- сырой `curl`/`wget` в папки `crypto2`/`forensics3`/... вместо
+  `init_challenge_workspace` → `<category>/<slug>/attachments/`;
+- общий `NOTES.md` на всё событие вместо per-challenge журнала;
+- имена папок по номеру категории (`crypto`, `crypto2`, `crypto3`) вместо
+  слага задачи — теряется back-mapping «папка ↔ id ↔ solved»;
+- несколько разных задач в одной папке без подкаталогов;
+- оставленные пустые/мусорные каталоги от распаковки (755 пустых `w*` и
+  т.п.) — такой scratch должен идти в `/tmp` и зачищаться;
+- solve-скрипты `solve2.py`, `solve3.py`, `exploit_final.py` без указания,
+  какой из них сработал — помечайте каноничный в `NOTES.md`.
+
 ## 1. Response envelope
 
 ```
@@ -96,6 +138,31 @@ Response `data.status` is one of:
 against a challenge with `max_attempts` + `lockout` behavior can **permanently
 lock you out** of that challenge.
 
+## 3a. Auto-tracking of submissions (no manual log needed for the flag itself)
+
+`attempt()` now side-effects automatically (best-effort, **never** blocks the
+submission even if logging fails):
+
+- appends a dated entry to the active challenge's `NOTES.md` tagged by verdict
+  (`solved` / `failed` / `tried`);
+- on `correct` / `already_solved` flips `solved: true` (+ `solved_at`) in the
+  local `challenge.yaml` — this builds the back-mapping that was missing on
+  BroncoCTF 2026 (`<ws>/<category>/<slug>/challenge.yaml` ↔ challenge id ↔
+  solved status).
+
+This means the flag submission itself is always recorded. **Intermediate
+steps** (hypotheses, tool runs, wrong guesses before the final attempt) still
+require explicit `ctfd.log_attempt(...)` — only the agent knows those.
+
+To reconcile local tracking with server truth (catches drift like
+"22 local vs 25 server"):
+
+```bash
+python scripts/ctfd_client.py status          # offline-capable (no token = local-only)
+python scripts/ctfd_client.py sync --dry-run  # preview
+python scripts/ctfd_client.py sync            # backfill challenge.yaml from my_solves()
+```
+
 ## 4. Downloading attached files
 
 `GET /api/v1/challenges/<id>` → `data.files[]` are **already-signed URLs**.
@@ -133,11 +200,13 @@ for f in detail.get("files", []):
 **During solving:**
 - Write every solve script / exploit to `ws/"scripts"` and **run it from there**
   (`cd <ws>/scripts && python solve.py`). Large/ephemeral output → `/tmp`.
-- After each meaningful step (hypothesis, tool run, attempt, flag), append:
+- After each **intermediate** step (hypothesis, tool run, wrong guess) append:
   ```python
   ctfd.log_attempt(42, "SSRF in ReturnUrl confirmed; /flag readable via 127.0.0.1:5000", status="tried")
-  ctfd.log_attempt(42, "NHNC{...}", status="solved")
   ```
+- The final **flag submission** is logged automatically by `attempt()` — no
+  manual `log_attempt(..., "solved")` needed; it also flips `solved: true` in
+  `challenge.yaml` (see §3a).
 - `event` slug auto-derives from host (`nhnc.ic3dt3a.org` → `nhnc-2026`);
   override with `CTFD_EVENT=...` env var.
 
@@ -171,14 +240,28 @@ import sys; sys.path.insert(0, "scripts")   # or copy ctfd_client.py next to you
 from ctfd_client import CTfdClient
 
 ctfd = CTfdClient("https://ctf.example.com", token="ctfd_...")   # or from_env() / from_userpass(...)
-chals = ctfd.list_challenges()                                   # cached list of all challenges
+# list_challenges() — единая точка «что нового»: diff новых задач против .seen.json
+# И слив новых анонсов из /notifications (подсказки/уточнения). См. §0a п.5.
+chals = ctfd.list_challenges()
 detail = ctfd.get_challenge(42)                                  # description, files, hints
 ws = ctfd.init_challenge_workspace(detail)                       # persistent workspace (§4a) — NOT /tmp
 for f in detail.get("files", []):
     ctfd.download_file(f)                                        # → ws/attachments/ (signed URLs already valid)
-# ... solve the challenge (use hexstrike_* tools — §7a); log steps to NOTES.md ...
+# ... solve the challenge (use hexstrike_* tools — §7a); log EACH step to NOTES.md ...
+ctfd.log_attempt(42, "SSRF confirmed, /flag readable via 127.0.0.1:5000", "tried")
 verdict = ctfd.attempt(42, "BugCTF{example_flag}")               # {"status":"correct","message":"..."}
-ctfd.log_attempt(42, "submitted BugCTF{example_flag}", "solved")
+# attempt() АВТОМАТИЧЕСКИ пишет солв в NOTES.md и ставит solved:true в challenge.yaml
+# (§3a). Ручной log_attempt для самого флага больше не нужен — только для
+# промежуточных шагов (см. чек-лист §0a).
+```
+
+Reconcile local tracking with server truth anytime (catches drift like
+"22 local vs 25 server"):
+
+```bash
+python scripts/ctfd_client.py status          # offline-capable; local-only if no token
+python scripts/ctfd_client.py sync --dry-run  # preview backfill
+python scripts/ctfd_client.py sync            # rebuild challenge.yaml from my_solves()
 ```
 
 Or via CLI straight from Bash:
