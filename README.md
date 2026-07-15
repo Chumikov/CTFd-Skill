@@ -159,7 +159,7 @@ python scripts/ctfd_client.py revoke-token 3
 python scripts/ctfd_client.py status          # сводка по воркспейсам + сверка с my_solves (оффлайн без --token)
 python scripts/ctfd_client.py sync --dry-run  # превью дозаполнения из сервера
 python scripts/ctfd_client.py sync            # создать/обновить challenge.json для серверных солвов
-python scripts/ctfd_client.py sync --all      # scaffодить все задачи без воркспейса (не только решённые)
+python scripts/ctfd_client.py sync --all      # создать scaffold для всех задач без воркспейса (не только решённых)
 python scripts/ctfd_client.py download-challenge 42   # init ws + скачать все файлы задачи в attachments/
 ```
 
@@ -199,7 +199,8 @@ python examples/solve_flow.py --submit-id 42 --flag 'flag{...}'
 - `init_challenge_workspace(detail)` создаёт scaffold + `description.md` + заголовок `NOTES.md`
   (idempotent: повторный вызов сохраняет `solved`/`solved_at`/`created_at`).
 - `download_file(f)` без `dest_dir` складывает файлы в `attachments/`. Без
-  активного воркспейса ругнётся в stderr и сохранит в `/tmp` (футган, не норма).
+  активного воркспейса ругнётся в stderr и сохранит в `/tmp` (это нежелательный
+  сценарий, не норма). При коллизии базового имени предупреждает о перезаписи.
 - `log_attempt(challenge_id, entry, status)` дописывает датированную запись в
   `NOTES.md` (`status`: `hypothesis` / `tried` / `solved` / `failed`).
 - `attempt()` **автоматически** логирует вердикт (все статусы, не только
@@ -231,6 +232,9 @@ python examples/solve_flow.py --submit-id 42 --flag 'flag{...}'
   всё равно пишутся в историю.
 - Токен — это полноценный доступ к вашему аккаунту. Не коммитьте его и не
   выкладывайте в чаты.
+- В CLI `--token <значение>` виден в списке процессов (`ps`) и истории оболочки.
+  Предпочитайте переменную окружения `CTFD_TOKEN` (или `CTFD_HOST`/`CTFD_TOKEN`
+  в `~/.bashrc`/`.zshrc` под `setopt HIST_IGNORE_SPACE` / `ignorespace`).
 - `unlock-hint` списывает реальные баллы с вашего/командного счёта.
 
 ## Структура проекта

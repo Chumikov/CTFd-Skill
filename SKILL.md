@@ -33,9 +33,15 @@ Authorization: Token <ctfd_...value>
 Content-Type: application/json
 ```
 
-> Critical CTFd quirk: the token is recognized ONLY when the request is JSON
-> (`Content-Type: application/json`). Without it the `Authorization` header is
-> silently ignored. The bundled client sets both headers for you.
+> Critical CTFd quirk (token login requires JSON): the `tokens` before_request
+> hook processes `Authorization: Token …` **only when `request.is_json` is
+> true** — i.e. the request carries `Content-Type: application/json`. This
+> applies to **all methods, including GET requests with no body**. Without it
+> the token is silently NOT authenticated (the request proceeds anonymous →
+> 403/redirect). Note CSRF is bypassed by the mere presence of the
+> `Authorization` header (separate `csrf` hook), but that does you no good
+> without the token actually logging you in. The bundled client sets both
+> headers on the session for every request, so it always works.
 
 If only username/password is available: CTFd has **no `/api/v1/login`**. Login
 is a form `POST /login` (fields `name`, `password`; `name` accepts username OR
@@ -43,56 +49,6 @@ email) that returns a `302` and a session cookie — no JSON, no token. Then a
 CSRF nonce must be carried as the `CSRF-Token: <nonce>` header on every
 state-changing request. Use `CTfdClient.from_userpass(...)` which does all of
 this. Token auth is simpler — prefer it whenever possible.
-
-## 0a. Обязательный чек-лист воркспейса (НЕ ПРОПУСКАТЬ)
-
-Типичная регрессия: скилл установлен, но `init_challenge_workspace` /
-`log_attempt` ни разу не вызываются за весь ивент — файлы сливались через
-сырой `curl` в ad-hoc папки по имени категории, единый общий `NOTES.md` вёл
-счётчик солвов с дрейфом относительно сервера, solve-скрипты терялись. Этот
-чек-лист — обязательный порядок действий на каждую задачу.
-
-**На каждое касание задачи ОБЯЗАТЕЛЬНО:**
-
-1. **Первое касание** — `ws = ctfd.init_challenge_workspace(detail)` ДО любого
-   скачивания/анализа. Никаких `curl`/`wget` в папки по имени категории.
-2. **Каждый файл задачи** — через `ctfd.download_file(f)` (положит в
-   `ws/attachments/`). `download_file` без активного воркспейса ругнётся в
-   stderr и сохранит в `/tmp` — это футган, не норма.
-3. **Каждый solve-скрипт / эксплойт** — писать в `ws/scripts/` и запускать
-   оттуда (`cd <ws>/scripts`). Эфемерный scratch (распакованные бинарники под
-   RE, разовые `curl`-пробы) — в `/tmp`, но авторский код — в `scripts/`.
-4. **Каждая гипотеза / запуск тулзы / попытка** —
-   `ctfd.log_attempt(id, text, status)`. Флаг-солв логируется автоматически
-   (см. §3a) — на это не полагаться для промежуточных шагов.
-5. **Перед взятием новой задачи** — `ctfd.list_challenges()`: единая точка
-   «что нового» — автоматически diff'ит новые задачи против снапшота
-   `~/Downloads/ctf/<event>/.seen.json` и сливает новые анонсы из
-   `/notifications` (подсказки/уточнения организаторов) с тегом классификации.
-   Организаторы публикуют задачи и постят подсказки по ходу ивента.
-   Caveats: (а) это **getter с side-effects** — он пишет `.seen.json` и делает
-   **второй HTTP-запрос** к `/notifications`; (б) **первый** опрос вываливает в
-   stderr newest 50 исторических анонсов (лимит `c._notifications_first_limit`,
-   по умолчанию 50); (в) классификация `hint`/`clarification`/`new`/`scoring`/
-   `general` — эвристика по ключевикам, не 100%. Для тихого обзора передайте
-   `update_seen=False` и/или `poll_notifications=False`. **Не вызывайте с
-   фильтром** (`category=...`) до первого полного (без фильтров) вызова —
-   иначе baseline останется неполным и детект новых отключится.
-6. **Возобновление сессии** (новый запуск / после компактизации контекста) —
-   перечитать `ws/NOTES.md` активной задачи; periodically сверяться через
-   `python scripts/ctfd_client.py status` (ловит дрейф солвов vs сервер).
-
-**АНТИПАТТЕРНЫ** (ровно то, что привело к регрессии — НЕ повторять):
-- сырой `curl`/`wget` в папки `crypto2`/`forensics3`/... вместо
-  `init_challenge_workspace` → `<category>/<slug>/attachments/`;
-- общий `NOTES.md` на всё событие вместо per-challenge журнала;
-- имена папок по номеру категории (`crypto`, `crypto2`, `crypto3`) вместо
-  слага задачи — теряется back-mapping «папка ↔ id ↔ solved»;
-- несколько разных задач в одной папке без подкаталогов;
-- оставленные пустые/мусорные каталоги от распаковки и brute-force циклов
-  — такой scratch должен идти в `/tmp` и зачищаться;
-- solve-скрипты `solve2.py`, `solve3.py`, `exploit_final.py` без указания,
-  какой из них сработал — помечайте каноничный в `NOTES.md`.
 
 ## 1. Response envelope
 
@@ -157,7 +113,7 @@ submission even if logging fails):
   journal too (tagged `failed` / `tried`), so a brute-force session will
   produce multiple entries — that's intentional, it's the audit trail;
 - on `correct` / `already_solved` flips `solved: true` (+ `solved_at`) in the
-  local `challenge.json` — this builds the back-mapping required by §0a
+  local `challenge.json` — this builds the back-mapping required by §4a
   (`<ws>/<category>/<slug>/challenge.json` ↔ challenge id ↔ solved status).
   Legacy `challenge.yaml` is read with fallback and migrated to `.json` on
   the next `init_challenge_workspace`.
@@ -214,7 +170,36 @@ Default location: `~/Downloads/ctf/<event>/<category>/<slug>/`.
 > `CTFD_EVENT=<correct-slug>` explicitly — otherwise the workspace tree lands
 > under a misnamed folder.
 
-**On first touch of any challenge** (before downloading or attempting):
+**Workspace discipline — follow on EVERY challenge:**
+
+1. **First touch** — `ws = ctfd.init_challenge_workspace(detail)` BEFORE any
+   download/analysis. No raw `curl`/`wget` into category-named folders.
+2. **Every challenge file** — via `ctfd.download_file(f)` (lands in
+   `ws/attachments/`). With no active workspace it warns to stderr and falls
+   back to `/tmp` — that's a footgun, not the norm.
+3. **Every solve script / exploit** — write to `ws/scripts/` and run it from
+   there (`cd <ws>/scripts && python solve.py`). Ephemeral scratch (extracted
+   binaries under RE, one-off probes) → `/tmp`; authored code → `scripts/`.
+4. **Every hypothesis / tool run / attempt** — `ctfd.log_attempt(id, text,
+   status)`. The flag solve is logged automatically by `attempt()` (§3a) —
+   don't rely on that for intermediate steps.
+5. **Before taking a new challenge** — `ctfd.list_challenges()`: the single
+   "what's new" entry point — diffs new challenges against the
+   `~/Downloads/ctf/<event>/.seen.json` snapshot and drains new
+   `/notifications` (organizer hints/clarifications) with a classification
+   tag. Challenges and hints land mid-event. Caveats: it's a **getter with
+   side-effects** (writes `.seen.json` + a **second HTTP request** to
+   `/notifications`); the **first** poll prints the newest 50 historical
+   notifications (`c._notifications_first_limit`, default 50); the
+   `hint`/`clarification`/`new`/`scoring`/`general` tag is a keyword
+   heuristic, not 100%. For a quiet pass use `update_seen=False` and/or
+   `poll_notifications=False`. **Do not** call it with a filter
+   (`category=...`) before the first unfiltered call — the baseline stays
+   incomplete and new-challenge detection is disabled.
+6. **Resuming a session** (fresh start / after context compaction) — re-read
+   `ws/NOTES.md` of the active challenge; periodically reconcile with
+   `python scripts/ctfd_client.py status` (catches solve drift vs server).
+
 ```python
 detail = ctfd.get_challenge(42)
 ws = ctfd.init_challenge_workspace(detail)        # scaffold + description.md + NOTES header
@@ -223,21 +208,25 @@ for f in detail.get("files", []):
     ctfd.download_file(f)                         # dest_dir=None → ws/attachments
 ```
 
-**During solving:**
-- Write every solve script / exploit to `ws/"scripts"` and **run it from there**
-  (`cd <ws>/scripts && python solve.py`). Large/ephemeral output → `/tmp`.
-- After each **intermediate** step (hypothesis, tool run, wrong guess) append:
-  ```python
-  ctfd.log_attempt(42, "SSRF in ReturnUrl confirmed; /flag readable via 127.0.0.1:5000", status="tried")
-  ```
-- The final **flag submission** is logged automatically by `attempt()` — no
-  manual `log_attempt(..., "solved")` needed; it also flips `solved: true` in
-  `challenge.json` (see §3a).
-- `event` slug auto-derives from host (`ctf.example.com` → `example-2026`);
-  override with `CTFD_EVENT=...` env var.
+`event` slug auto-derives from host (`ctf.example.com` → `example-2026`);
+override with `CTFD_EVENT=...` env var (see year-derivation caveat above).
 
-Only truly ephemeral scratch (one-off `curl` probes, extracted binaries under
-RE) goes to `/tmp`. Self-authored work goes to the persistent workspace.
+**Anti-patterns** (exactly what caused past regressions — do NOT repeat):
+- raw `curl`/`wget` into `crypto2`/`forensics3`/... folders instead of
+  `init_challenge_workspace` → `<category>/<slug>/attachments/`;
+- a single shared `NOTES.md` for the whole event instead of a per-challenge
+  journal;
+- folder names by category index (`crypto`, `crypto2`, `crypto3`) instead of
+  the challenge slug — loses the folder ↔ id ↔ solved back-mapping;
+- several different challenges dumped in one folder with no subdirectories;
+- empty/junk directories left from extraction and brute-force loops — such
+  scratch belongs in `/tmp` and should be cleaned up;
+- `solve2.py`, `solve3.py`, `exploit_final.py` with no marker for the one
+  that worked — mark the canonical solver in `NOTES.md`.
+
+Only truly ephemeral scratch (one-off network probes, extracted binaries
+under RE) goes to `/tmp`. All authored work (scripts, notes, downloads) goes
+to the persistent workspace.
 
 ## 5. Unlocking a hint (costs points!)
 
@@ -266,8 +255,8 @@ import sys; sys.path.insert(0, "scripts")   # or copy ctfd_client.py next to you
 from ctfd_client import CTfdClient
 
 ctfd = CTfdClient("https://ctf.example.com", token="ctfd_...")   # or from_env() / from_userpass(...)
-# list_challenges() — единая точка «что нового»: diff новых задач против .seen.json
-# И слив новых анонсов из /notifications (подсказки/уточнения). См. §0a п.5.
+# list_challenges() — single "what's new" entry point: diffs new challenges
+# vs .seen.json AND drains new /notifications (hints/clarifications). See §4a.
 chals = ctfd.list_challenges()
 detail = ctfd.get_challenge(42)                                  # description, files, hints
 ws = ctfd.init_challenge_workspace(detail)                       # persistent workspace (§4a) — NOT /tmp
@@ -276,10 +265,10 @@ for f in detail.get("files", []):
 # ... solve the challenge (use hexstrike_* tools — §7a); log EACH step to NOTES.md ...
 ctfd.log_attempt(42, "SSRF confirmed, /flag readable via 127.0.0.1:5000", "tried")
 verdict = ctfd.attempt(42, "flag{example_flag}")                 # {"status":"correct","message":"..."}
-# attempt() АВТОМАТИЧЕСКИ пишет вердикт в NOTES.md и при correct ставит
-# solved:true в challenge.json (§3a). Логируются ВСЕ вердикты (вкл. incorrect).
-# Ручной log_attempt для самого флага больше не нужен — только для
-# промежуточных шагов (см. чек-лист §0a).
+# attempt() AUTOMATICALLY logs the verdict to NOTES.md and, on correct, sets
+# solved:true in challenge.json (§3a). ALL verdicts are logged (incl. incorrect).
+# Manual log_attempt for the flag itself is no longer needed — only for
+# intermediate steps (see checklist §4a).
 ```
 
 Reconcile local tracking with server truth anytime (catches drift like
@@ -323,8 +312,11 @@ definitions from context) is exactly what this section prevents.
 
 **Fall back to raw bash only when:**
 - HexStrike lacks the specific tool, OR
-- You need a one-off `curl`/`nc` probe (then `cd /tmp` first — never in `/home/kali` root), OR
-- You're doing local binary RE / forensics (`gdb`/`r2`/`binwalk` — stay in bash, on local files).
+- You need a one-off network probe (`curl`/`nc`) — run it from `/tmp` (one-off
+  probes are fine in `/tmp`; all authored work stays in the persistent
+  workspace, see §4a), OR
+- You're doing local binary RE / forensics (`gdb`/`r2`/`binwalk` — stay in
+  bash, on local files).
 
 **Log each HexStrike run in the challenge journal** via
 `ctfd.log_attempt(<id>, "ran hexstrike_port_scan(target, mode=full) → ports 22,80,8080", status="tried")`
