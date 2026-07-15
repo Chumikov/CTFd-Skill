@@ -152,6 +152,7 @@ python scripts/ctfd_client.py scoreboard                 --host "$CTFD_HOST" --t
 python scripts/ctfd_client.py top 10                     --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py hint 7                     --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py unlock-hint 7              --host "$CTFD_HOST" --token "$CTFD_TOKEN"
+python scripts/ctfd_client.py unlock-solution 7          --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py notifications --since-id 5 --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py gen-token --description "automation" --expiration 2026-12-31
 python scripts/ctfd_client.py tokens

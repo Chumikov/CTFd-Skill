@@ -393,7 +393,7 @@ class CTfdClient:
         Побочные эффекты (best-effort, НИКОГДА не рвут сабмит):
         - автоматически дописывает запись в ``NOTES.md`` активной задачи;
         - при ``correct``/``already_solved`` выставляет ``solved: true`` в
-          локальном ``challenge.yaml`` (back-mapping «папка ↔ id ↔ solved»).
+          локальном ``challenge.json`` (back-mapping «папка ↔ id ↔ solved»).
         Если воркспейс для задачи не инициализирован — авто-лог тихо пропускается.
         """
         data = self._request(
@@ -519,7 +519,7 @@ class CTfdClient:
         Структура::
 
             <base>/<event>/<category>/<slug>/
-            ├── challenge.yaml      метаданные CTFd (id, name, host, ...)
+            ├── challenge.json      метаданные CTFd (id, name, host, ...)
             ├── description.md      условие задачи
             ├── attachments/        скачанные файлы
             ├── scripts/            самописные solve-скрипты (запускать отсюда)
