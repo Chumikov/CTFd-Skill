@@ -28,7 +28,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
+try:
+    import requests
+except ImportError as _e:  # pragma: no cover
+    raise ImportError(
+        "Требуется пакет requests: pip install requests"
+    ) from _e
 
 __all__ = [
     "CTfdClient",
@@ -489,6 +494,13 @@ class CTfdClient:
             url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1] or "download.bin"
         )
         out = dest / name
+        if out.exists():
+            print(
+                f"[ctfd] WARNING: download_file перезаписывает существующий файл "
+                f"{out} (коллизия базового имени «{name}»). Если нужно "
+                f"сохранить оба — переименуйте или задайте dest_dir.",
+                file=sys.stderr,
+            )
         with self.session.get(url, stream=True, timeout=self.timeout) as r:
             r.raise_for_status()
             with open(out, "wb") as fh:
@@ -572,16 +584,22 @@ class CTfdClient:
         status: Optional[str] = None,
         *,
         _silent: bool = False,
+        _ws: Optional[Path] = None,
     ) -> Path:
         """Дописать датированную запись в ``NOTES.md`` задачи.
 
         ``status`` — короткая метка (``'hypothesis'``/``'tried'``/``'solved'``/
-        ``'failed'``/...). Если активный воркспейс не задан, ищется по
-        ``challenge_id`` в метаданных воркспейса; если не найден — запись
-        теряется с предупреждением в stderr (если не ``_silent`` — используется
-        авто-логом :meth:`_autolog_attempt`, чтобы не шуметь без воркспейса).
+        ``'failed'``/...). Воркспейс берётся из ``_ws`` (если задан — используется
+        авто-логом, чтобы НЕ мутировать ``self._active_ws``), иначе из активного
+        или по ``challenge_id``. Если воркспейс не найден — запись теряется с
+        предупреждением в stderr (если не ``_silent``).
+
+        Мутация ``self._active_ws`` выполняется только при явном (не ``_silent``)
+        вызове — чтобы авто-лог сабмита другой задачи не переназначал активный
+        воркспейс (иначе ``download_file``/``log_attempt`` незаметно уходили в
+        папку не той задачи).
         """
-        ws = self._active_ws or self._find_workspace_by_id(challenge_id)
+        ws = _ws or self._active_ws or self._find_workspace_by_id(challenge_id)
         if ws is None:
             if not _silent:
                 print(
@@ -590,7 +608,8 @@ class CTfdClient:
                     file=sys.stderr,
                 )
             return Path()
-        self._active_ws = ws
+        if not _silent:
+            self._active_ws = ws
         notes = ws / "NOTES.md"
         ts = time.strftime("%Y-%m-%dT%H:%M:%S")
         head = f"## [{ts}] {status}" if status else f"## [{ts}]"
@@ -825,22 +844,25 @@ class CTfdClient:
         """Best-effort запись попытки в NOTES.md + solved:true при корректе.
 
         Любая ошибка подавляется — журналирование НИКОГДА не блокирует сабмит.
-        Делегирует запись в :meth:`log_attempt` (``_silent=True``), чтобы формат
-        журнала был определён в одном месте.
+        Воркспейс ищется локально по ``challenge_id`` (без мутирования
+        ``self._active_ws``) и передаётся в :meth:`log_attempt` через ``_ws=`` —
+        поэтому сабмит чужой задачи не сбивает активный воркспейс и не пишет
+        солв/marks в папку не той задачи. Формат журнала определён в одном месте.
         """
         try:
             status = verdict_data.get("status", "unknown")
             message = verdict_data.get("message", "")
             tag = _STATUS_LOG.get(status, "tried")
             preview = submission if len(submission) <= 80 else submission[:77] + "..."
+            ws = self._find_workspace_by_id(challenge_id)
+            if ws is None:
+                return  # без воркспейса логировать некуда — тихо
             self.log_attempt(
                 challenge_id, f"submit `{preview}` -> {status}: {message}", tag,
-                _silent=True,
+                _silent=True, _ws=ws,
             )
             if status in ("correct", "already_solved"):
-                ws = self._active_ws or self._find_workspace_by_id(challenge_id)
-                if ws is not None:
-                    self._mark_solved_meta(ws, True)
+                self._mark_solved_meta(ws, True)
         except Exception:
             pass
 
@@ -1075,6 +1097,8 @@ def _build_parser() -> argparse.ArgumentParser:
     h.add_argument("id", type=int)
     hu = sub.add_parser("unlock-hint", help="Разблокировать хинт (стоимость в баллах)")
     hu.add_argument("id", type=int)
+    su = sub.add_parser("unlock-solution", help="Разблокировать официальное решение (стоимость в баллах)")
+    su.add_argument("id", type=int)
 
     dl = sub.add_parser("download", help="Скачать файл по URL")
     dl.add_argument("url")
@@ -1106,7 +1130,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sy.add_argument(
         "--all",
         action="store_true",
-        help="scaffодить ВСЕ задачи без локального воркспейса (не только решённые)",
+        help="scaffold все задачи без локального воркспейса (не только решённые)",
     )
 
     dc = sub.add_parser(
@@ -1142,6 +1166,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         _print(c.get_hint(args.id))
     elif cmd == "unlock-hint":
         _print(c.unlock_hint(args.id))
+    elif cmd == "unlock-solution":
+        _print(c.unlock_solution(args.id))
     elif cmd == "download":
         _print(str(c.download_file(args.url, args.out)))
     elif cmd == "notifications":
