@@ -10,7 +10,7 @@
     export CTFD_HOST=https://ctf.example.com
     export CTFD_TOKEN=ctfd_xxxxxxxxxxxxxxxx
     python examples/solve_flow.py                       # только чтение
-    python examples/solve_flow.py --submit-id 42 --flag 'BugCTF{...}'
+    python examples/solve_flow.py --submit-id 42 --flag 'flag{...}'
 """
 
 from __future__ import annotations

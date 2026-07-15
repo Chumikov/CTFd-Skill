@@ -1,6 +1,6 @@
 ---
 name: ctfd-api
-description: Work with any CTFd-platform CTF via its REST API (api/v1) as a player — list and read challenges, download attached files, submit flags (with correct handling of every attempt status incl. ratelimited), unlock hints, view scoreboard, poll notifications, manage own user/team and API tokens. Use whenever the user references a CTF running on CTFd (e.g. ctf.bug-makers.ru) or says "submit a flag", "list challenges", "show the scoreboard", "download the challenge files" for a CTFd instance. Generic across all CTFd hosts. Player-oriented.
+description: Work with any CTFd-platform CTF via its REST API (api/v1) as a player — list and read challenges, download attached files, submit flags (with correct handling of every attempt status incl. ratelimited), unlock hints, view scoreboard, poll notifications, manage own user/team and API tokens. Use whenever the user references a CTF running on CTFd (e.g. ctf.example.com) or says "submit a flag", "list challenges", "show the scoreboard", "download the challenge files" for a CTFd instance. Generic across all CTFd hosts. Player-oriented.
 license: MIT
 compatibility: opencode
 metadata:
@@ -12,7 +12,7 @@ metadata:
 
 Generic client for any CTFd (https://ctfd.io) instance REST API v1. All paths
 below are relative to the instance base URL `<HOST>`
-(e.g. `https://ctf.bug-makers.ru`). Works the same on every CTFd host.
+(e.g. `https://ctf.example.com`). Works the same on every CTFd host.
 
 A ready Python client + CLI is bundled at `./scripts/ctfd_client.py`. **Prefer
 importing/calling it** over hand-rolled curl — it already handles auth headers,
@@ -46,11 +46,11 @@ this. Token auth is simpler — prefer it whenever possible.
 
 ## 0a. Обязательный чек-лист воркспейса (НЕ ПРОПУСКАТЬ)
 
-Регрессия на BroncoCTF 2026: скилл был установлен, но `init_challenge_workspace`
-/ `log_attempt` ни разу не вызвались за весь уикенд — файлы сливались через
+Типичная регрессия: скилл установлен, но `init_challenge_workspace` /
+`log_attempt` ни разу не вызываются за весь ивент — файлы сливались через
 сырой `curl` в ad-hoc папки по имени категории, единый общий `NOTES.md` вёл
-счётчик солвов с дрейфом (22 локально vs 25 на сервере), solve-скрипты
-терялись. Этот чек-лист — обязательный порядок действий на каждую задачу.
+счётчик солвов с дрейфом относительно сервера, solve-скрипты терялись. Этот
+чек-лист — обязательный порядок действий на каждую задачу.
 
 **На каждое касание задачи ОБЯЗАТЕЛЬНО:**
 
@@ -89,8 +89,8 @@ this. Token auth is simpler — prefer it whenever possible.
 - имена папок по номеру категории (`crypto`, `crypto2`, `crypto3`) вместо
   слага задачи — теряется back-mapping «папка ↔ id ↔ solved»;
 - несколько разных задач в одной папке без подкаталогов;
-- оставленные пустые/мусорные каталоги от распаковки (755 пустых `w*` и
-  т.п.) — такой scratch должен идти в `/tmp` и зачищаться;
+- оставленные пустые/мусорные каталоги от распаковки и brute-force циклов
+  — такой scratch должен идти в `/tmp` и зачищаться;
 - solve-скрипты `solve2.py`, `solve3.py`, `exploit_final.py` без указания,
   какой из них сработал — помечайте каноничный в `NOTES.md`.
 
@@ -157,10 +157,10 @@ submission even if logging fails):
   journal too (tagged `failed` / `tried`), so a brute-force session will
   produce multiple entries — that's intentional, it's the audit trail;
 - on `correct` / `already_solved` flips `solved: true` (+ `solved_at`) in the
-  local `challenge.json` — this builds the back-mapping that was missing on
-  BroncoCTF 2026 (`<ws>/<category>/<slug>/challenge.json` ↔ challenge id ↔
-  solved status). Legacy `challenge.yaml` is read with fallback and migrated
-  to `.json` on the next `init_challenge_workspace`.
+  local `challenge.json` — this builds the back-mapping required by §0a
+  (`<ws>/<category>/<slug>/challenge.json` ↔ challenge id ↔ solved status).
+  Legacy `challenge.yaml` is read with fallback and migrated to `.json` on
+  the next `init_challenge_workspace`.
 
 This means the flag submission itself is always recorded. **Intermediate
 steps** (hypotheses, tool runs, wrong guesses before the final attempt) still
@@ -194,7 +194,7 @@ on restart). A CTF weekend was once lost entirely because solve scripts in
 Default location: `~/Downloads/ctf/<event>/<category>/<slug>/`.
 
 ```
-~/Downloads/ctf/nhnc-2026/web/login_page/
+~/Downloads/ctf/example-2026/web/login_page/
 ├── challenge.json      # CTFd metadata (id, name, host, solved) — back-mapping
 ├── description.md      # challenge statement from CTFd
 ├── attachments/        # downloaded challenge files (chal.zip, binaries, images)
@@ -209,7 +209,7 @@ Default location: `~/Downloads/ctf/<event>/<category>/<slug>/`.
 > cursor) lives one level up, alongside the category folders.
 
 > **Year-derivation caveat:** `<event>` is derived from the host as
-> `<first-non-generic-label>-<current-year>` (e.g. `nhnc-2026`). For a CTF
+> `<first-non-generic-label>-<current-year>` (e.g. `example-2026`). For a CTF
 > played near a year boundary, or branded with a different year/season, set
 > `CTFD_EVENT=<correct-slug>` explicitly — otherwise the workspace tree lands
 > under a misnamed folder.
@@ -233,7 +233,7 @@ for f in detail.get("files", []):
 - The final **flag submission** is logged automatically by `attempt()` — no
   manual `log_attempt(..., "solved")` needed; it also flips `solved: true` in
   `challenge.json` (see §3a).
-- `event` slug auto-derives from host (`nhnc.ic3dt3a.org` → `nhnc-2026`);
+- `event` slug auto-derives from host (`ctf.example.com` → `example-2026`);
   override with `CTFD_EVENT=...` env var.
 
 Only truly ephemeral scratch (one-off `curl` probes, extracted binaries under
@@ -275,7 +275,7 @@ for f in detail.get("files", []):
     ctfd.download_file(f)                                        # → ws/attachments/ (signed URLs already valid)
 # ... solve the challenge (use hexstrike_* tools — §7a); log EACH step to NOTES.md ...
 ctfd.log_attempt(42, "SSRF confirmed, /flag readable via 127.0.0.1:5000", "tried")
-verdict = ctfd.attempt(42, "BugCTF{example_flag}")               # {"status":"correct","message":"..."}
+verdict = ctfd.attempt(42, "flag{example_flag}")                 # {"status":"correct","message":"..."}
 # attempt() АВТОМАТИЧЕСКИ пишет вердикт в NOTES.md и при correct ставит
 # solved:true в challenge.json (§3a). Логируются ВСЕ вердикты (вкл. incorrect).
 # Ручной log_attempt для самого флага больше не нужен — только для
@@ -294,7 +294,7 @@ python scripts/ctfd_client.py sync            # rebuild challenge.json from my_s
 Or via CLI straight from Bash:
 ```
 python scripts/ctfd_client.py challenges   --host "$CTFD_HOST" --token "$CTFD_TOKEN"
-python scripts/ctfd_client.py submit 42 "BugCTF{...}" --host "$CTFD_HOST" --token "$CTFD_TOKEN"
+python scripts/ctfd_client.py submit 42 "flag{...}" --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py me --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 ```
 

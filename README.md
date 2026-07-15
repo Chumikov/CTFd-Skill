@@ -16,8 +16,8 @@ REST-интерфейс (`/api/v1`). Помогает участвовать в 
   (`correct` / `incorrect` / `already_solved` / `partial` / `ratelimited` / …)
 - **Авто-фиксация солвов**: `attempt()` сам дописывает результат в `NOTES.md`
   задачи (все вердикты, не только `correct`) и при `correct` ставит
-  `solved: true` в `challenge.json` — счётчик решённых больше не разъезжается
-  с сервером (регрессия BroncoCTF 2026: локально 22 vs сервер 25)
+  `solved: true` в `challenge.json` — счётчик решённых больше не
+  разъезжается с сервером
 - **Обнаружение новых задач и анонсов**: `list_challenges()` автоматически
   diff'ит новые задачи против снапшота `.seen.json` и сливает подсказки/
   уточнения из `/notifications` (с тегом `hint`/`clarification`/`new`/...)
@@ -109,9 +109,9 @@ export CTFD_TOKEN="ctfd_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 Просто попросите естественным языком, например:
 
-- «покажи список задач на ctf.bug-makers.ru»
+- «покажи список задач на ctf.example.com»
 - «открой задачу 42 и скачай её файлы»
-- «подай флаг `BugCTF{demo}` в задаче 42»
+- «подай флаг `flag{demo}` в задаче 42»
 
 Агент сам загрузит скилл и вызовет нужный метод.
 
@@ -130,7 +130,7 @@ for f in detail["files"]:
     c.download_file(f)                          # → ws/attachments/ (dest_dir=None по умолчанию)
 c.log_attempt(42, "Начало решения", "hypothesis")  # запись в ws/NOTES.md
 # ... решение (для offsec — prefer hexstrike_* тулам, см. SKILL.md §7a) ...
-verdict = c.attempt(42, "BugCTF{example}")      # {"status": "correct", ...}
+verdict = c.attempt(42, "flag{example}")        # {"status": "correct", ...}
 # attempt() сам логирует вердикт в NOTES.md и ставит solved:true в challenge.json
 # (см. SKILL.md §3a). Ручной log_attempt(..., "solved") больше не нужен.
 ```
@@ -146,7 +146,7 @@ c = CTfdClient.from_userpass("https://ctf.example.com", "username", "password")
 ```bash
 python scripts/ctfd_client.py challenges                 --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py challenge 42               --host "$CTFD_HOST" --token "$CTFD_TOKEN"
-python scripts/ctfd_client.py submit 42 'BugCTF{...}'    --host "$CTFD_HOST" --token "$CTFD_TOKEN"
+python scripts/ctfd_client.py submit 42 'flag{...}'        --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py me                         --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py scoreboard                 --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py top 10                     --host "$CTFD_HOST" --token "$CTFD_TOKEN"
@@ -168,7 +168,7 @@ python scripts/ctfd_client.py download-challenge 42   # init ws + скачать
 ```bash
 python examples/solve_flow.py
 python examples/solve_flow.py --show-id 42
-python examples/solve_flow.py --submit-id 42 --flag 'BugCTF{...}'
+python examples/solve_flow.py --submit-id 42 --flag 'flag{...}'
 ```
 
 > `python examples/solve_flow.py --submit-id 42 --flag '...'` — подача флага
@@ -189,7 +189,7 @@ python examples/solve_flow.py --submit-id 42 --flag 'BugCTF{...}'
 └── NOTES.md            # журнал хода решения (append через log_attempt)
 ```
 
-- `<event>` выводится из host инстанса (`nhnc.ic3dt3a.org` → `nhnc-2026`,
+- `<event>` выводится из host инстанса (`ctf.example.com` → `example-2026`,
   `<label>-<текущий год>`); override через env `CTFD_EVENT` (обязательно для
   CTF у границы года или с другим брендингом).
 - `challenge.json` содержит JSON (в старых версиях назывался `challenge.yaml` —

@@ -513,7 +513,7 @@ class CTfdClient:
             ├── scripts/            самописные solve-скрипты (запускать отсюда)
             └── NOTES.md            журнал хода решения (append)
 
-        ``event`` выводится из host (напр. ``nhnc.ic3dt3a.org`` → ``nhnc-2026``);
+        ``event`` выводится из host (напр. ``ctf.example.com`` → ``example-2026``);
         override через env ``CTFD_EVENT``. Воркспейс переживает ребуты
         (по умолчанию в ``~/Downloads/ctf``).
         """
@@ -635,7 +635,7 @@ class CTfdClient:
                 pass
 
     def _derive_event_slug(self) -> str:
-        """event-слаг из host: ``nhnc.ic3dt3a.org`` → ``nhnc-YYYY``.
+        """event-слаг из host: ``ctf.example.com`` → ``example-YYYY``.
 
         Первый не-generic label (skip www/ctf/chall/...) + текущий год.
         """
