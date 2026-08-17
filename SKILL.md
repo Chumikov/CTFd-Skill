@@ -50,6 +50,10 @@ CSRF nonce must be carried as the `CSRF-Token: <nonce>` header on every
 state-changing request. Use `CTfdClient.from_userpass(...)` which does all of
 this. Token auth is simpler — prefer it whenever possible.
 
+> **Host behind Cloudflare?** A plain HTTP client gets `403 Just a moment...`
+> instead of JSON. The client detects this and can route everything through a
+> real browser tab (CDP browser bridge) — see §6a before fighting it manually.
+
 ## 1. Response envelope
 
 ```
@@ -96,6 +100,20 @@ Response `data.status` is one of:
 | `ratelimited` | HTTP 429, anti-bruteforce triggered | wait the N seconds in `message`, then retry ONCE |
 | `authentication_required` | HTTP 403, token/session expired | re-auth, then retry |
 | `paused` | Admin paused the game | wait |
+
+`attempt()` returns a `SubmitResult` (dict-compatible): besides
+`verdict["status"]` (backward-compat) it exposes typed properties
+`verdict.correct` (true for `correct` *and* `already_solved`),
+`verdict.already_solved`, `verdict.ratelimited`, `verdict.message`.
+
+**`correct` ≠ "landed in the score".** During a score freeze `/challenges`
+keeps showing a solved task as unsolved even for accepted flags (cost a
+real reconciliation detour once). `attempt()` therefore cheap-verifies
+every `correct`/`already_solved` against `GET /users/me/solves` (the
+source of truth) and sets `verdict["scored"]` (`True`/`False`; key absent
+if the check itself failed — network etc.). On a mismatch it prints a
+warning and journals it to `NOTES.md`. Opt out with
+`attempt(..., verify_score=False)`.
 
 **NEVER hammer `/attempt`.** The client auto-parses the wait seconds from the
 429 message and sleeps once before a single retry. Repeated wrong submissions
@@ -199,10 +217,18 @@ Default location: `~/Downloads/ctf/<event>/<category>/<slug>/`.
 6. **Resuming a session** (fresh start / after context compaction) — re-read
    `ws/NOTES.md` of the active challenge; periodically reconcile with
    `python scripts/ctfd_client.py status` (catches solve drift vs server).
+   Suspect workspace sprawl (subagents!) — `python scripts/ctfd_client.py
+   events` lists every event tree under the base with workspace counts;
+   two slugs for one event are visible immediately.
 
 ```python
 detail = ctfd.get_challenge(42)
 ws = ctfd.init_challenge_workspace(detail)        # scaffold + description.md + NOTES header
+                                                  # auto_unlock_free_hints=True опционально —
+                                                  # разблокирует хинты с cost<=0 (бесплатные)
+# description.md теперь HTML→Markdown (markdownify если установлен, иначе regex-fallback).
+# connection_info в challenge.json: серверное ИЛИ извлечённое из описания
+# (nc/ncat/ssh/URL regex'ами — CTFd часто не заполняет поле явно).
 # downloads now land in ws/attachments/ automatically:
 for f in detail.get("files", []):
     ctfd.download_file(f)                         # dest_dir=None → ws/attachments
@@ -248,6 +274,66 @@ POST /api/v1/unlocks   {"type":"hints","target":<hint_id>}
 - **No standard `X-RateLimit-*` headers.** Trust the JSON body.
 - The client handles the attempt 429 automatically.
 
+## 6a. Browser bridge (Cloudflare) — CDP transport
+
+Public CTFd instances increasingly sit behind Cloudflare; a plain HTTP
+client then receives a challenge page (`403 Just a moment...`) instead of
+JSON — on one CF-fronted CTF this killed EVERY client feature for the
+whole event (submits via hand-rolled page-context fetch, ~10 tool calls
+per downloaded file, no autolog, no notification polling). The bundled
+client now makes the browser a first-class transport:
+
+1. Launch Chromium/Chrome with remote debugging:
+   `chromium --remote-debugging-port=9222` (endpoint override:
+   `CTFD_CDP_URL`).
+2. Open the CTFd host in a tab, pass the Cloudflare check, log in. The
+   tab's session cookie is what authorizes bridge requests; a configured
+   API token is ALSO sent.
+3. Point the client at the bridge — `CTFD_BRIDGE` env or
+   `CTfdClient(..., bridge=...)`:
+   - `auto` (**default**): plain requests first; on the first
+     Cloudflare response the client transparently switches to the bridge
+     and retries (one-time switch, notice on stderr);
+   - `cdp`: bridge only, from the first request;
+   - `off` (alias `requests`): never use the bridge; CF answers raise
+     `CloudflareBlocked` with a hint instead of raw HTML.
+
+With the bridge active every feature works exactly as over direct HTTP:
+`attempt()` (429 backoff + NOTES.md autolog + solved flip + scored
+check), file downloads (base64 through the tab), `.seen.json`, notification
+polling, `sync`/`status`. Requirements: `pip install websocket-client`
+(lazy import); username/password login through the bridge is NOT
+supported — log in inside the browser instead.
+
+**Manual fallback recipes** (no client at hand — e.g. only
+`chrome-devtools_evaluate_script` is available; this is the smuggling
+pipeline, use it when the client can't run):
+
+```js
+// Any API call in the page context (authorized by the tab's session):
+async () => {
+  const r = await fetch("/api/v1/challenges", {
+    credentials: "include",
+    headers: {"Content-Type": "application/json"},
+  });
+  return {status: r.status, body: await r.text()};
+}
+// Submit: same fetch with method: "POST" and
+// body: JSON.stringify({challenge_id: N, submission: "flag{...}"}).
+```
+
+```js
+// File download (base64 pipeline — chunks of 32768 to keep apply() small):
+async () => {
+  const r = await fetch("<signed file URL>", {credentials: "include"});
+  const buf = new Uint8Array(await r.arrayBuffer());
+  let s = "";
+  for (let i = 0; i < buf.length; i += 32768)
+    s += String.fromCharCode.apply(null, buf.subarray(i, i + 32768));
+  return btoa(s);  // save via evaluate_script filePath, then `base64 -d`
+}
+```
+
 ## 7. Recommended workflow (using the bundled client)
 
 ```python
@@ -257,18 +343,43 @@ from ctfd_client import CTfdClient
 ctfd = CTfdClient("https://ctf.example.com", token="ctfd_...")   # or from_env() / from_userpass(...)
 # list_challenges() — single "what's new" entry point: diffs new challenges
 # vs .seen.json AND drains new /notifications (hints/clarifications). See §4a.
+# detail="full" — параллельно догружает описания/файлы/хинты для каждой задачи
+# (полезно для triage на больших CTF; по умолчанию "list" = 1 запрос).
 chals = ctfd.list_challenges()
+chals_full = ctfd.list_challenges(detail="full", max_workers=8)
 detail = ctfd.get_challenge(42)                                  # description, files, hints
 ws = ctfd.init_challenge_workspace(detail)                       # persistent workspace (§4a) — NOT /tmp
+                                                                  # + scaffold scripts/solve.py
+                                                                  # под категорию задачи (pwn/web/...).
+                                                                  # auto_unlock_free_hints=True опционально —
+                                                                  # разблокирует хинты с cost<=0 (бесплатные)
 for f in detail.get("files", []):
     ctfd.download_file(f)                                        # → ws/attachments/ (signed URLs already valid)
 # ... solve the challenge (use hexstrike_* tools — §7a); log EACH step to NOTES.md ...
 ctfd.log_attempt(42, "SSRF confirmed, /flag readable via 127.0.0.1:5000", "tried")
-verdict = ctfd.attempt(42, "flag{example_flag}")                 # {"status":"correct","message":"..."}
+verdict = ctfd.attempt(42, "flag{example_flag}")                 # SubmitResult (dict-compatible)
+if verdict.correct: print("solved:", verdict.message)            # property-access
 # attempt() AUTOMATICALLY logs the verdict to NOTES.md and, on correct, sets
 # solved:true in challenge.json (§3a). ALL verdicts are logged (incl. incorrect).
 # Manual log_attempt for the flag itself is no longer needed — only for
 # intermediate steps (see checklist §4a).
+```
+
+**Async-клиент** (для параллельных операций на больших CTF — `pip install httpx`):
+
+```python
+import asyncio
+from ctfd_client import AsyncCTfdClient
+
+async def main():
+    c = AsyncCTfdClient.from_env()                              # или AsyncCTfdClient(host, token=...)
+    async with c:                                               # auto aclose()
+        # detail="full" использует asyncio.gather — намного быстрее синхронного
+        chals = await c.list_challenges(detail="full")
+        # параллельная скачка нескольких файлов
+        await asyncio.gather(*[c.download_file(f) for f in chals[0]["files"]])
+        verdict = await c.attempt(42, "flag{example}")
+asyncio.run(main())
 ```
 
 Reconcile local tracking with server truth anytime (catches drift like
@@ -280,7 +391,8 @@ python scripts/ctfd_client.py sync --dry-run  # preview backfill
 python scripts/ctfd_client.py sync            # rebuild challenge.json from my_solves()
 ```
 
-Or via CLI straight from Bash:
+Or via CLI straight from Bash (global `--host`/`--token` are accepted BOTH
+before and after the subcommand):
 ```
 python scripts/ctfd_client.py challenges   --host "$CTFD_HOST" --token "$CTFD_TOKEN"
 python scripts/ctfd_client.py submit 42 "flag{...}" --host "$CTFD_HOST" --token "$CTFD_TOKEN"
@@ -321,6 +433,52 @@ definitions from context) is exactly what this section prevents.
 **Log each HexStrike run in the challenge journal** via
 `ctfd.log_attempt(<id>, "ran hexstrike_port_scan(target, mode=full) → ports 22,80,8080", status="tried")`
 so offensive work is traceable in `NOTES.md`.
+
+## 7b. Subagents and CTFd — solve in parallel, submit IMMEDIATELY
+
+Subagents (Task tool) do NOT have this skill loaded; left unsupervised
+they grow parallel workspace trees (`event-2026` vs `2026-event`) and
+would batch flags until "all subtasks are done" — an 8-hour submission
+delay once hid a rotated flag and critical organizer announcements.
+The canon that prevents both:
+
+**A subagent that finds a flag SUBMITS IT IMMEDIATELY itself** — via one
+CLI call — and returns the verdict, not the bare flag.
+
+Put into EVERY subagent prompt:
+- challenge id + name, the canonical `CTFD_EVENT` slug, and the workspace
+  path `<ws>` — the subagent works INSIDE it, it never creates one;
+- the exact submission command (global args work after the subcommand):
+
+  ```bash
+  python <skill-path>/scripts/ctfd_client.py submit <id> "<flag>" \
+      --host "$CTFD_HOST" --token "$CTFD_TOKEN"
+  ```
+
+  (with `CTFD_BRIDGE`/browser arranged by the orchestrator — §6a — this
+  works behind Cloudflare too);
+- instruction: on solve, return the verdict JSON
+  (`status`/`message`/`scored`) of the submit command, not just the flag.
+
+**Subagent allow-list** (everything else is orchestrator-only):
+- ✅ `submit` — immediately, upon flag discovery;
+- ✅ `log_attempt` / appending to the challenge's `NOTES.md`;
+- ❌ `list_challenges` with side-effects and `notifications` — parallel
+  writes to `.seen.json` from several subagents corrupt the cursor
+  (new-challenge detection and the notification drain stay with the
+  orchestrator);
+- ❌ `unlock-hint` / `unlock-solution` — they cost points; hint decisions
+  belong to the orchestrator;
+- ❌ workspace scaffolding / folder creation (that's where parallel
+  `event-2026` vs `2026-event` trees came from).
+
+**Fallback:** if the submit command fails (no bridge, network down), the
+subagent returns the flag prefixed `UNSUBMITTED: ` and the orchestrator
+submits as soon as transport is back.
+
+After collecting results the orchestrator reconciles: `status` → `sync`
+(solved flips already landed in each `challenge.json` via §3a autolog),
+and `events` to confirm no parallel trees appeared.
 
 ## 8. What is NOT covered (admin only — out of scope for a player)
 

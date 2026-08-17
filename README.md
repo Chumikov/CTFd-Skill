@@ -12,8 +12,30 @@ REST-интерфейс (`/api/v1`). Помогает участвовать в 
 ## Возможности
 
 - Список и детальный просмотр челленджей (категории, баллы, число солвов, «решил ли я»)
+- **Browser bridge (Cloudflare) — CDP-транспорт**: если инстанс за CF и
+  прямой HTTP получает `403 Just a moment...`, клиент детектит
+  challenge-страницу (`CloudflareBlocked`) и гоняет ВСЕ вызовы через
+  реальную вкладку Chromium (`fetch` в контексте страницы, файлы — base64).
+  Режимы `CTFD_BRIDGE`: `auto` (по умолчанию — прозрачно переключается при
+  первом CF-ответе), `cdp` (только мост), `off`. Все фичи (autolog, 429,
+  `.seen.json`, нотификации) работают и через мост
+- **Скор-верификация после `correct`**: `attempt()` дёшево сверяет, что
+  солв реально виден в `/users/me/solves` (истина в последней инстанции),
+  и кладёт результат в `verdict["scored"]` — при заморозке скоринга
+  `/challenges` врёт, и расхождение ловится сразу (`verify_score=False`
+  отключает)
+- **CLI: `--host`/`--token` принимаются и ДО, и ПОСЛЕ подкоманды** —
+  `ctfd_client.py submit 42 'flag' --host ...` работает
+- **CLI `events`**: список деревьев событий в базе воркспейсов — детектор
+  «расползания» (параллельные `event-2026` vs `2026-event` от субагентов)
+- **Канон для субагентов** (SKILL.md §7b): субагент, найдя флаг, сабмитит
+  его сам немедленно одной CLI-командой и возвращает вердикт; ему
+  передаются id/`CTFD_EVENT`/путь воркспейса; запретены side-effect вызовы
+  и трата баллов
 - **Подача флагов** с обработкой всех вариантов ответа
   (`correct` / `incorrect` / `already_solved` / `partial` / `ratelimited` / …)
+  — возвращается `SubmitResult` (dict-совместимый объект с типизированными
+  property `verdict.correct`, `verdict.already_solved`, `verdict.ratelimited`)
 - **Авто-фиксация солвов**: `attempt()` сам дописывает результат в `NOTES.md`
   задачи (все вердикты, не только `correct`) и при `correct` ставит
   `solved: true` в `challenge.json` — счётчик решённых больше не
@@ -27,8 +49,36 @@ REST-интерфейс (`/api/v1`). Помогает участвовать в 
   `sync --all` — скаффолит вообще все задачи без воркспейса)
 - Автоматический backoff при `429` (антибрутфорс CTFd) — клиент сам читает
   число секунд ожидания из ответа и делает один повтор
+- **CSRF retry при 403**: при session-cookie авторизации клиент автоматически
+  рефетчит свежий nonce и ретраит POST один раз (для token-авторизации не нужно)
 - Скачивание приложенных файлов по уже подписанным URL
+- **HTML → Markdown для `description.md`**: условие задачи приводится к
+  читаемому Markdown (soft-dep на [`markdownify`](https://pypi.org/project/markdownify/),
+  при отсутствии — встроенный regex-fallback)
+- **Auto-extract `connection_info`**: если CTFd не заполнил поле явно,
+  клиент извлекает `nc host port` / `ncat` / `ssh user@host` / URL из описания
+  и сохраняет в `challenge.json`
+- **Auto-unlock бесплатных хинтов** (`auto_unlock_free_hints=True` в
+  `init_challenge_workspace`): хинты с `cost<=0` открываются автоматически,
+  чтобы дать агенту максимум контекста без траты баллов (идея из
+  [ctf-agent/pull_challenges.py](https://github.com/verialabs/ctf-agent)).
+  Платные хинты НЕ трогаются.
 - **Персистентный воркспейс** под каждую задачу (`~/Downloads/ctf/<event>/<category>/<slug>/`) — файлы, скрипты и журнал переживают ребуты (не `/tmp`)
+- **Шаблоны `solve.py` по категориям**: при `init_challenge_workspace` в `scripts/`
+  автоматически кладётся готовый скелет: pwn → `pwntools` + `remote(host,port)`,
+  web → `requests`, crypto → `pycryptodome`/`gmpy2` подсказки, rev → `angr`/`r2`,
+  forensics → `binwalk`/`volatility`, misc → универсальный stub. Шаблон
+  генерируется один раз (idempotent — пользовательские правки не перезаписываются).
+  Переопределить свои шаблоны можно в `~/.config/ctfd/templates/<category>.tmpl`.
+- **`list_challenges(detail="full")`**: по умолчанию один запрос на список задач
+  (быстро, даже на CTF со 100+ задачами). Опционально `detail="full"` параллельно
+  догружает описания/файлы/хинты для каждой задачи через пул потоков — удобно
+  для triage по всем условиям сразу (как `fetch_all_challenges` у ctf-agent).
+- **Async-клиент** (`AsyncCTfdClient` на `httpx.AsyncClient`): зеркалит sync-API,
+  но все HTTP-методы — coroutines. `list_challenges(detail="full")` использует
+  `asyncio.gather` для максимально быстрого triage, `download_file` идёт
+  параллельно. Workspace-методы делегируют в sync-impl через `asyncio.to_thread`.
+  `httpx` — опциональная зависимость (lazy-import).
 - **Журнал хода решения** `NOTES.md` — автодополнение датированных записей (гипотеза/попытка/результат)
 - **Подсказка агенту предпочитать `hexstrike_*` MCP-тулы** для offsec-задач (переживает компактизацию контекста)
 - Разблокировка подсказок и официальных решений (с учётом стоимости в баллах)
@@ -43,6 +93,16 @@ REST-интерфейс (`/api/v1`). Помогает участвовать в 
 - [opencode](https://opencode.ai) ≥ 2.x
 - Python 3.8+
 - [`requests`](https://pypi.org/project/requests/) — `pip install requests`
+- [`markdownify`](https://pypi.org/project/markdownify/) — **опционально**;
+  при установке HTML-описания задач конвертируются в Markdown точнее.
+  Без неё используется встроенный regex-fallback.
+- [`httpx`](https://pypi.org/project/httpx/) — **опционально**; только если
+  используется `AsyncCTfdClient` для параллельных операций.
+- [`websocket-client`](https://pypi.org/project/websocket-client/) —
+  **опционально**; только для browser bridge (CDP-транспорт за Cloudflare).
+  Понадобится Chromium, запущенный с `--remote-debugging-port=9222`.
+
+Для разработки/тестов: `pip install -r requirements-dev.txt` (pytest, httpx, markdownify).
 
 ## Установка
 
@@ -123,16 +183,41 @@ sys.path.insert(0, "scripts")
 from ctfd_client import CTfdClient
 
 c = CTfdClient.from_env()                       # читает CTFD_HOST / CTFD_TOKEN
-print(c.list_challenges())                      # список задач
+print(c.list_challenges())                      # список задач (1 запрос, быстро)
+# detail="full" — параллельно догружает описания/файлы/хинты (пул потоков):
+chals_full = c.list_challenges(detail="full", max_workers=8)
 detail = c.get_challenge(42)                    # условие, файлы, хинты
 ws = c.init_challenge_workspace(detail)         # персистентный воркспейс (НЕ /tmp)
+                                                # + scripts/solve.py готовый под категорию
+# auto_unlock_free_hints=True — открыть хинты с cost<=0 без траты баллов:
+# ws = c.init_challenge_workspace(detail, auto_unlock_free_hints=True)
 for f in detail["files"]:
     c.download_file(f)                          # → ws/attachments/ (dest_dir=None по умолчанию)
 c.log_attempt(42, "Начало решения", "hypothesis")  # запись в ws/NOTES.md
 # ... решение (для offsec — prefer hexstrike_* тулам, см. SKILL.md §7a) ...
-verdict = c.attempt(42, "flag{example}")        # {"status": "correct", ...}
+verdict = c.attempt(42, "flag{example}")        # SubmitResult (dict-compatible)
+if verdict.correct:                             # property-access
+    print("решено:", verdict.message)
+print(verdict["status"])                        # backward-compat: dict-access
 # attempt() сам логирует вердикт в NOTES.md и ставит solved:true в challenge.json
 # (см. SKILL.md §3a). Ручной log_attempt(..., "solved") больше не нужен.
+```
+
+Async-вариант (`pip install httpx`):
+
+```python
+import asyncio
+from ctfd_client import AsyncCTfdClient
+
+async def main():
+    async with AsyncCTfdClient.from_env() as c:
+        # detail="full" использует asyncio.gather — быстро на больших CTF
+        chals = await c.list_challenges(detail="full")
+        await asyncio.gather(*[c.download_file(f) for f in chals[0]["files"]])
+        verdict = await c.attempt(42, "flag{example}")
+        print(verdict.correct, verdict.message)
+
+asyncio.run(main())
 ```
 
 Авторизация по паролю (если нет токена):
@@ -142,6 +227,8 @@ c = CTfdClient.from_userpass("https://ctf.example.com", "username", "password")
 ```
 
 ### Через CLI
+
+Глобальные `--host`/`--token` принимаются как до, так и после подкоманды.
 
 ```bash
 python scripts/ctfd_client.py challenges                 --host "$CTFD_HOST" --token "$CTFD_TOKEN"
@@ -162,6 +249,18 @@ python scripts/ctfd_client.py sync --dry-run  # превью дозаполне�
 python scripts/ctfd_client.py sync            # создать/обновить challenge.json для серверных солвов
 python scripts/ctfd_client.py sync --all      # создать scaffold для всех задач без воркспейса (не только решённых)
 python scripts/ctfd_client.py download-challenge 42   # init ws + скачать все файлы задачи в attachments/
+python scripts/ctfd_client.py events         # все деревья событий в ~/Downloads/ctf (детектор расползания)
+```
+
+### Хост за Cloudflare (browser bridge)
+
+```bash
+# 1. Браузер с remote debugging + вкладка с пройденным CF-челленджем и логином:
+chromium --remote-debugging-port=9222 &
+# 2. Клиент: мост с первого запроса...
+CTFD_BRIDGE=cdp python scripts/ctfd_client.py challenges --host "$CTFD_HOST" --token "$CTFD_TOKEN"
+#    ...или ничего не делать: режим auto (по умолчанию) переключится сам
+#    при первом же CF-ответе.
 ```
 
 Демо end-to-end сценария (только чтение по умолчанию):
@@ -199,15 +298,21 @@ python examples/solve_flow.py --submit-id 42 --flag 'flag{...}'
   лежит на уровень выше, рядом с папками категорий.
 - `init_challenge_workspace(detail)` создаёт scaffold + `description.md` + заголовок `NOTES.md`
   (idempotent: повторный вызов сохраняет `solved`/`solved_at`/`created_at`).
+  Опциональный параметр `auto_unlock_free_hints=True` открывает бесплатные
+  хинты (`cost<=0`) сразу — максимум контекста агенту без траты баллов.
+  Поле `connection_info` в `challenge.json` заполняется серверным значением,
+  **либо** извлекается из описания задачи (regex по `nc`/`ncat`/`ssh`/URL).
+  Само описание конвертируется из HTML в Markdown (через `markdownify` если
+  установлен, иначе встроенным regex-fallback).
 - `download_file(f)` без `dest_dir` складывает файлы в `attachments/`. Без
   активного воркспейса ругнётся в stderr и сохранит в `/tmp` (это нежелательный
   сценарий, не норма). При коллизии базового имени предупреждает о перезаписи.
 - `log_attempt(challenge_id, entry, status)` дописывает датированную запись в
   `NOTES.md` (`status`: `hypothesis` / `tried` / `solved` / `failed`).
-- `attempt()` **автоматически** логирует вердикт (все статусы, не только
-  `correct`) и при `correct`/`already_solved` ставит `solved: true` в
-  `challenge.json` — ручной `log_attempt` для самого флага не нужен, только
-  для промежуточных шагов.
+- `attempt()` возвращает `SubmitResult` (dict-совместимый): `verdict["status"]`
+  для старого кода, `verdict.correct` / `.already_solved` / `.ratelimited` /
+  `.message` — для нового. Автоматически логирует вердикт (все статусы) и
+  при `correct`/`already_solved` ставит `solved: true` в `challenge.json`.
 - `list_challenges()` **автоматически** детектит новые задачи (diff против
   `.seen.json`) и новые анонсы из `/notifications` (с тегом классификации).
   Состояние события хранится в `~/Downloads/ctf/<event>/.seen.json`. Это getter
@@ -219,6 +324,13 @@ python examples/solve_flow.py --submit-id 42 --flag 'flag{...}'
 
 Эпемерный scratch (разовые `curl`-пробы, распакованные бинарники) по-прежнему
 идёт в `/tmp`. Самописные скрипты — в `scripts/` воркспейса.
+
+> **Шаблоны `solve.py` по категориям**: при `init_challenge_workspace` под
+> задачу автоматически создаётся `scripts/solve.py` с готовым скелетом под
+> её категорию (pwn → `pwntools`, web → `requests`, crypto → `pycryptodome`
+> и т.д.). Шаблон создаётся один раз — пользовательские правки не
+> перезаписываются. Переопределить: положить свой файл в
+> `~/.config/ctfd/templates/<category>.tmpl` (или `.py`).
 
 > **HexStrike-интеграция**: в `SKILL.md` (§7a) агенту предписано prefer'ить
 > `hexstrike_*` MCP-тулы для offsec-задач — инструкция живёт в скилле и не
@@ -244,13 +356,32 @@ python examples/solve_flow.py --submit-id 42 --flag 'flag{...}'
 CTFd-Skill/
 ├── SKILL.md                 # тело навыка для opencode
 ├── scripts/
-│   └── ctfd_client.py       # Python-клиент + CLI
+│   └── ctfd_client.py       # Python-клиент + CLI (sync + async)
 ├── examples/
 │   └── solve_flow.py        # демо: список → скачать → флаг
+├── tests/                   # pytest smoke-тесты (хелперы + воркспейс)
+│   ├── test_smoke.py        #   чистые хелперы без HTTP
+│   ├── test_workspace.py    #   init workspace, шаблоны, attempt с моками
+│   └── test_bridge.py       #   CDP-мост, Cloudflare-детект, scored, events
+├── requirements.txt         # runtime: requests
+├── requirements-dev.txt     # dev: pytest, httpx, markdownify, websocket-client
 ├── README.md                # этот файл
 ├── LICENSE                  # MIT
 └── .gitignore
 ```
+
+## Разработка и тесты
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v             # 146 smoke-тестов (хелперы + воркспейс + мост, без HTTP)
+pytest tests/test_smoke.py   # только чистые хелперы
+pytest tests/test_bridge.py  # мост/CF/scored/events
+```
+
+Тесты не делают реальных HTTP-запросов: HTTP-слой мокается через
+`monkeypatch`, файловые операции — через `tmp_path`. End-to-end smoke
+демо против живого CTFd: `python examples/solve_flow.py`.
 
 ## Совместимость
 
