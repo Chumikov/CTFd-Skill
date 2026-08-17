@@ -1,0 +1,4 @@
+# Runtime-зависимости CTFd-Skill.
+# Установка:  pip install -r requirements.txt
+
+requests>=2.20

@@ -1,0 +1,13 @@
+# Зависимости для разработки/тестирования CTFd-Skill.
+# Установка:  pip install -r requirements-dev.txt
+# (или:  pip install -r requirements-dev.txt -e .   когда появится pyproject.toml)
+
+-r requirements.txt
+
+# Тесты
+pytest>=7.0
+
+# Опциональные зависимости клиента (для полного покрытия тестами)
+httpx>=0.24            # AsyncCTfdClient
+markdownify>=0.11      # более точный HTML→Markdown (без неё — regex-fallback)
+websocket-client>=1.6  # browser bridge за Cloudflare (CDP-транспорт)
