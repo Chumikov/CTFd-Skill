@@ -14,12 +14,22 @@ session-cookie через логин/пароль.
 Использование как CLI::
 
     python ctfd_client.py challenges --host https://ctf.example.com --token ctfd_...
+    python ctfd_client.py --host https://ctf.example.com --token ctfd_... challenges
     python ctfd_client.py submit 42 "flag{...}" --host ... --token ...
+
+Глобальные ``--host``/``--token`` принимаются как до, так и после подкоманды.
+
+Если хост за Cloudflare (прямой HTTP получает challenge-страницу) — включите
+browser bridge через CDP: запустите Chromium с ``--remote-debugging-port=9222``,
+откройте и авторизуйтесь на CTFd-хосте, затем ``CTFD_BRIDGE=cdp`` (или
+``CTfdClient(..., bridge="cdp")``). В режиме по умолчанию ``auto`` клиент сам
+переключится на мост при первом же Cloudflare-ответе.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -37,8 +47,12 @@ except ImportError as _e:  # pragma: no cover
 
 __all__ = [
     "CTfdClient",
+    "AsyncCTfdClient",
     "CTfdError",
     "RateLimited",
+    "CloudflareBlocked",
+    "CDPBridge",
+    "SubmitResult",
     "CTFD_HOST_ENV",
     "CTFD_TOKEN_ENV",
 ]
@@ -49,10 +63,220 @@ API_PREFIX = "/api/v1"
 
 _SEC_RE = re.compile(r"(\d+)\s+seconds?", re.IGNORECASE)
 _NONCE_PATTERNS = [
-    re.compile(r'["\']csrfNonce["\']\s*[:=]\s*["\']([0-9a-f]+)["\']', re.IGNORECASE),
-    re.compile(r'name=["\']nonce["\']\s+value=["\']([0-9a-f]+)["\']', re.IGNORECASE),
-    re.compile(r'<meta[^>]+csrf[^>]+content=["\']([0-9a-f]+)["\']', re.IGNORECASE),
+    # JavaScript-форма: window.csrfNonce = "abc123"; (типичный CTFd layout)
+    re.compile(r'\bcsrfNonce\s*[:=]\s*["\']([0-9a-fA-F]+)["\']'),
+    # JSON-форма: {"csrfNonce": "..."} или 'csrfNonce': '...'
+    re.compile(r'["\']csrfNonce["\']\s*[:=]\s*["\']([0-9a-fA-F]+)["\']', re.IGNORECASE),
+    # <input name="nonce" value="...">
+    re.compile(r'name=["\']nonce["\']\s+value=["\']([0-9a-fA-F]+)["\']', re.IGNORECASE),
+    # <meta name="csrf-token" content="...">
+    re.compile(r'<meta[^>]+csrf[^>]+content=["\']([0-9a-fA-F]+)["\']', re.IGNORECASE),
 ]
+
+# Регэкспы для auto-extract'а connection_info из описания задачи (HTML или MD).
+# Порядок = приоритет (nc/ncat — самый частый случай для pwn-задач).
+_CONN_PATTERNS = [
+    re.compile(r"\bnc\s+([a-zA-Z0-9._\-]+)\s+(\d{1,5})\b"),
+    re.compile(r"\bncat\s+([a-zA-Z0-9._\-]+)\s+(\d{1,5})\b"),
+    re.compile(r"\bssh\s+\S+@([a-zA-Z0-9._\-]+)(?:\s+-p\s*(\d{1,5}))?\b"),
+    re.compile(r"(https?://[a-zA-Z0-9._\-]+(?::\d{1,5})?(?:/[^\s\"'<>]*)?)"),
+]
+
+# Pattern для среза оставшихся HTML-тегов (используется regex-fallback конвертера).
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+# Встроенные шаблоны solve.py по категориям. Используются в
+# ``init_challenge_workspace`` для предзаполнения ``scripts/solve.py``. Плейсхолдеры:
+#   {{name}}             — имя задачи (без экранирования)
+#   {{slug}}             — slug имени (lowercase, не-буквы → '_')
+#   {{host}}             — host инстанса CTFd (без схемы)
+#   {{connection_info}}  — извлечённое connection_info (или пустая строка)
+#   {{flag_prefix}}      — предполагаемый префикс флага (по host), напр. 'flag{...}'
+# Пользователь может переопределить любой шаблон, положив файл
+# ``~/.config/ctfd/templates/<category>.tmpl`` (или ``<category>.py``).
+
+_DEFAULT_TEMPLATES: Dict[str, str] = {
+    "pwn": '''#!/usr/bin/env python3
+"""{{name}} — pwn solve stub.
+
+Сгенерировано CTFd-Skill; отредактируйте под задачу. Запускать из воркспейса:
+    python scripts/solve.py
+"""
+from pwn import remote, context, ELF, log
+{% if connection_info %}# connection_info: {{connection_info}}
+HOST, PORT = "{{host}}", 0  # TODO: подставьте порт из connection_info
+{% else %}# TODO: подставьте HOST/PORT задачи (см. условие в ../description.md)
+HOST, PORT = "{{host}}", 1337
+{% endif %}
+
+def main() -> None:
+    # binary = ELF("../attachments/<binary>")  # если есть локальный файл
+    io = remote(HOST, PORT)
+    io.recvuntil(b">")  # TODO: подставьте prompt
+    payload = b"A" * 0  # TODO: полезная нагрузка
+    io.sendline(payload)
+    flag = io.recvline(timeout=5).decode(errors="replace").strip()
+    log.success("flag candidate: %s", flag)
+    io.close()
+
+
+if __name__ == "__main__":
+    main()
+''',
+    "web": '''#!/usr/bin/env python3
+"""{{name}} — web solve stub.
+
+Сгенерировано CTFd-Skill; отредактируйте под задачу.
+"""
+import requests
+{% if connection_info %}BASE = "{{connection_info}}".splitlines()[0]
+{% else %}BASE = "https://{{host}}"  # TODO: подставьте URL задачи
+{% endif %}
+SESSION = requests.Session()
+
+def main() -> None:
+    r = SESSION.get(f"{BASE}/", timeout=15)
+    print(r.status_code, r.headers.get("Content-Type"))
+    # TODO: реализуйте эксплойт
+    # payload = {"input": "test"}
+    # r = SESSION.post(f"{BASE}/submit", data=payload)
+    # flag = r.text
+    # print("flag candidate:", flag)
+
+if __name__ == "__main__":
+    main()
+''',
+    "crypto": '''#!/usr/bin/env python3
+"""{{name}} — crypto solve stub.
+
+Сгенерировано CTFd-Skill; отредактируйте под задачу.
+"""
+# from Crypto.Cipher import AES  # pycryptodome
+# from Crypto.Util.number import long_to_bytes, GCD
+# import gmpy2  # pip install gmpy2
+# import sympy
+
+{% if connection_info %}# connection_info: {{connection_info}}
+# При необходимости поднять socket к серверу — см. pwn-шаблон.
+{% endif %}
+
+def main() -> None:
+    # Пример: декодер base64 / атака на RSA / etc.
+    # from base64 import b64decode
+    # enc = b64decode("<base64>")
+    # print("plaintext:", enc)
+    print("TODO: реализуйте решение")
+
+if __name__ == "__main__":
+    main()
+''',
+    "rev": '''#!/usr/bin/env python3
+"""{{name}} — rev solve stub.
+
+Сгенерировано CTFd-Skill; отредактируйте под задачу. Локальный анализ:
+    r2 -A ../attachments/<binary>
+    gdb ../attachments/<binary>
+"""
+# import angr  # символическийExecution
+# import r2pipe
+
+def main() -> None:
+    # proj = angr.Project("../attachments/<binary>", auto_load_libs=False)
+    # state = proj.factory.entry_state()
+    # sm = proj.factory.simulation_manager(state)
+    # sm.explore(find=lambda s: b"correct" in s.posix.dumps(1))
+    # print("flag:", sm.found[0].posix.dumps(1))
+    print("TODO: реверс-инжиниринг в ../attachments/")
+
+if __name__ == "__main__":
+    main()
+''',
+    "forensics": '''#!/usr/bin/env python3
+"""{{name}} — forensics solve stub.
+
+Сгенерировано CTFd-Skill; отредактируйте под задачу. Полезные тулы:
+    binwalk -e ../attachments/<file>
+    foremost -i ../attachments/<file> -o /tmp/forensics_out
+    volatility -f ../attachments/<memdump> imageinfo
+"""
+# from PIL import Image
+# import magic
+
+def main() -> None:
+    # file_path = "../attachments/<file>"
+    # with open(file_path, "rb") as f:
+    #     data = f.read()
+    # print("size:", len(data))
+    print("TODO: forensics-анализ в ../attachments/")
+
+if __name__ == "__main__":
+    main()
+''',
+    "misc": '''#!/usr/bin/env python3
+"""{{name}} — misc solve stub (CTFd-Skill).
+
+Универсальный скелет — отредактируйте под задачу.
+"""
+import sys
+from pathlib import Path
+
+def main() -> None:
+    # Чтение приложенных файлов:
+    # for f in Path("../attachments").iterdir():
+    #     print(f.name, f.stat().st_size)
+    print("TODO: реализуйте решение")
+
+if __name__ == "__main__":
+    main()
+''',
+}
+
+# Категория по умолчанию, если в CTFd встретится неизвестная категория.
+_DEFAULT_CATEGORY = "misc"
+
+
+def _category_templates_dir() -> Path:
+    """Пользовательская папка переопределений: ``~/.config/ctfd/templates/``."""
+    return Path(os.path.expanduser("~/.config/ctfd/templates"))
+
+
+def _render_template(text: str, ctx: Dict[str, str]) -> str:
+    """Простая подстановка плейсхолдеров ``{{key}}`` + ``{% if x %}...[{% else %}...]{% endif %}``.
+
+    Условный блок рисуется только если ``ctx[x]`` непустой. Необязательный
+    ``{% else %}`` отдаётся при пустом/отсутствующем значении. Реализовано через
+    последовательные regex-замены (без зависимостей от Jinja).
+    """
+    out = text
+
+    def _cond(m: re.Match) -> str:
+        body_if = m.group(2)
+        body_else = m.group(3) or ""
+        return body_if if ctx.get(m.group(1), "").strip() else body_else
+
+    out = re.sub(
+        r"\{%\s*if\s+(\w+)\s*%\}(.*?)(?:\{%\s*else\s*%\}(.*?))?(\{%\s*endif\s*%\})",
+        _cond,
+        out,
+        flags=re.DOTALL,
+    )
+    out = re.sub(r"\{\{\s*(\w+)\s*\}\}", lambda m: ctx.get(m.group(1), ""), out)
+    return out
+
+
+def _solve_template_for(category: str) -> Optional[str]:
+    """Вернуть текст шаблона для категории (пользовательский > встроенный).
+
+    Возвращает ``None`` только если категория неизвестна и пользовательского
+    файла нет. В callers используется fallback на misc.
+    """
+    cat = (category or "").strip().lower()
+    user_dir = _category_templates_dir()
+    for fname in (f"{cat}.tmpl", f"{cat}.py", f"{cat}.txt"):
+        uf = user_dir / fname
+        if uf.exists():
+            return uf.read_text(encoding="utf-8")
+    return _DEFAULT_TEMPLATES.get(cat)
 
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
@@ -95,6 +319,293 @@ class RateLimited(CTfdError):
         self.retry_in = retry_in
 
 
+class CloudflareBlocked(CTfdError):
+    """Хост за Cloudflare: транспорт получил challenge-страницу вместо API.
+
+    Лечение — browser bridge (CDP): Chromium с --remote-debugging-port,
+    вкладка с уже пройденным CF-челленджем и авторизацией на CTFd.
+    См. SKILL.md, секция «Browser bridge (Cloudflare)».
+    """
+
+
+# Сильные маркеры CF-челленджа в HTML (голое слово "cloudflare" НЕ маркер:
+# оно регулярно встречается в текстах задач). Проверяются только в ответах
+# со статусом 200/403/429/503.
+_CF_MARKERS = (
+    "just a moment",
+    "attention required",
+    "cf-challenge",
+    "__cf_chl",
+    "cdn-cgi/challenge-platform",
+    "cf-chl-browser-verification",
+    "cf_chl_opt",
+    "checking your browser before accessing",
+    "enable javascript and cookies to continue",
+    "ddos protection by",
+)
+
+_CF_HINT = (
+    "host is behind Cloudflare (challenge page). Включите browser bridge: "
+    "запустите Chromium с --remote-debugging-port=9222, откройте и "
+    "авторизуйтесь на CTFd-хосте, затем CTFD_BRIDGE=cdp (или bridge='cdp'). "
+    "См. SKILL.md «Browser bridge (Cloudflare)»."
+)
+
+
+def _looks_like_cloudflare(response: Any) -> bool:
+    """True, если ответ похож на CF-челлендж (статус + HTML-маркеры).
+
+    Работает с requests.Response, httpx.Response и _BridgeResponse —
+    достаточно интерфейса status_code/text.
+    """
+    try:
+        sc = int(getattr(response, "status_code", 0) or 0)
+        if sc not in (200, 403, 429, 503):
+            return False
+        text = (getattr(response, "text", "") or "")[:4000].lower()
+        return any(marker in text for marker in _CF_MARKERS)
+    except Exception:
+        return False
+
+
+class _BridgeResponse:
+    """Response-адаптер поверх результата fetch() через CDP-мост.
+
+    Минимальный интерфейс, общий с requests/httpx.Response, которого
+    хватает логике ``CTfdClient._request``: status_code, ok, content,
+    text, url, headers.get(), json().
+    """
+
+    def __init__(
+        self,
+        status: int,
+        content: bytes,
+        url: str,
+        content_type: str = "",
+    ):
+        self.status_code = int(status)
+        self.content = content
+        self.url = url
+        self.headers = {"Content-Type": content_type or ""}
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", errors="replace")
+
+    @property
+    def ok(self) -> bool:
+        return self.status_code < 400
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+class CDPBridge:
+    """Транспорт через Chrome DevTools Protocol: fetch() в контексте вкладки.
+
+    Обходит Cloudflare: HTTP-запросы выполняются в браузерном контексте,
+    который уже прошёл CF-челлендж (``credentials: 'include'`` даёт
+    session-cookie CTFd). Требует:
+
+    - запущенного Chromium/Chrome с ``--remote-debugging-port=9222``
+      (override: env ``CTFD_CDP_URL`` или аргумент ``endpoint``);
+    - открытой вкладки с CTFd-хостом (приоритет при выборе, иначе первая page).
+
+    Зависимость ``websocket-client`` импортируется лениво.
+    """
+
+    _B64_CHUNK = 32768  # размер чанка base64-конвертации в JS
+
+    def __init__(
+        self,
+        endpoint: Optional[str] = None,
+        *,
+        host: Optional[str] = None,
+        timeout: float = 30.0,
+    ):
+        try:
+            import websocket  # websocket-client
+        except ImportError as e:
+            raise CTfdError(
+                "CDP bridge требует пакет websocket-client: "
+                "pip install websocket-client"
+            ) from e
+        self._ws_mod = websocket
+        self.endpoint = (
+            endpoint
+            or os.environ.get("CTFD_CDP_URL")
+            or "http://127.0.0.1:9222"
+        ).rstrip("/")
+        self.host = host
+        self.timeout = timeout
+        self._ws: Optional[Any] = None
+        self._msgid = 0
+        self.target: Optional[Dict[str, Any]] = None
+
+    # -- подключение ---------------------------------------------------
+    def _http_json(self, path: str) -> Any:
+        import urllib.request
+
+        with urllib.request.urlopen(
+            f"{self.endpoint}{path}", timeout=self.timeout
+        ) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def connect(self) -> Dict[str, Any]:
+        """Подключиться к вкладке: приоритет — таб с URL CTFd-хоста."""
+        targets = self._http_json("/json")
+        pages = [t for t in targets if t.get("type") == "page"]
+        if not pages:
+            raise CTfdError(
+                "CDP: нет открытых вкладок (type=page). Откройте CTFd-хост "
+                "в браузере с включённым remote debugging."
+            )
+        chosen: Optional[Dict[str, Any]] = None
+        if self.host:
+            needle = self.host.split("//")[-1].rstrip("/")
+            chosen = next(
+                (t for t in pages if needle in (t.get("url") or "")), None
+            )
+        self.target = chosen or pages[0]
+        ws_url = self.target.get("webSocketDebuggerUrl")
+        if not ws_url:
+            raise CTfdError(
+                "CDP: у вкладки нет webSocketDebuggerUrl — перезапустите "
+                "браузер с --remote-debugging-port."
+            )
+        self._ws = self._ws_mod.create_connection(ws_url, timeout=self.timeout)
+        return self.target
+
+    def call(
+        self, method: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Одиночный CDP-вызов (JSON-RPC поверх WebSocket)."""
+        if self._ws is None:
+            self.connect()
+        assert self._ws is not None
+        self._msgid += 1
+        mid = self._msgid
+        self._ws.send(
+            json.dumps({"id": mid, "method": method, "params": params or {}})
+        )
+        while True:
+            data = json.loads(self._ws.recv())
+            if data.get("id") == mid:
+                if "error" in data:
+                    raise CTfdError(f"CDP error ({method}): {data['error']}")
+                return data.get("result") or {}
+            # события DevTools (Network.* и т.п.) молча пропускаем
+
+    def evaluate(self, expression: str) -> Any:
+        """Runtime.evaluate с awaitPromise; исключения JS → CTfdError."""
+        res = self.call(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "awaitPromise": True,
+                "returnByValue": True,
+            },
+        )
+        exc = res.get("exceptionDetails")
+        if exc:
+            desc = (
+                (exc.get("exception") or {}).get("description")
+                or exc.get("text")
+                or "unknown"
+            )
+            raise CTfdError(f"CDP evaluate failed: {desc}")
+        return (res.get("result") or {}).get("value")
+
+    # -- HTTP через fetch ----------------------------------------------
+    def http(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        body: Optional[str] = None,
+        binary: bool = False,
+    ) -> Dict[str, Any]:
+        """Выполнить HTTP-запрос через fetch() → ``{status, ct, body}``.
+
+        ``binary=True``: body — base64 сырых байтов (для скачивания файлов,
+        чанками по ``_B64_CHUNK``, чтобы не переполнить стек apply()).
+        """
+        chunk = self._B64_CHUNK
+        js = (
+            "(async () => {"
+            f"const r = await fetch({json.dumps(url)}, {{"
+            f"method: {json.dumps(method.upper())}, "
+            "'credentials': 'include', "
+            f"headers: {json.dumps(headers or {})}, "
+            f"body: {json.dumps(body)}"
+            "});"
+            "const ct = r.headers.get('content-type') || '';"
+            "let payload;"
+            f"if ({'true' if binary else 'false'}) {{"
+            "const buf = new Uint8Array(await r.arrayBuffer());"
+            "let s = '';"
+            f"for (let i = 0; i < buf.length; i += {chunk}) "
+            f"s += String.fromCharCode.apply(null, buf.subarray(i, i + {chunk}));"
+            "payload = btoa(s);"
+            "} else {"
+            "payload = await r.text();"
+            "}"
+            "return JSON.stringify({status: r.status, ct: ct, body: payload});"
+            "})()"
+        )
+        raw = self.evaluate(js)
+        if not isinstance(raw, str):
+            raise CTfdError("CDP: неожиданный результат evaluate (не строка)")
+        out = json.loads(raw)
+        return {
+            "status": out.get("status"),
+            "ct": out.get("ct", ""),
+            "body": out.get("body", ""),
+        }
+
+
+class SubmitResult(dict):
+    """Вердикт сабмита флага. Ведёт себя как dict (обратная совместимость со
+    старым кодом вида ``verdict["status"]``) и как типизированный объект
+    (property-access в стиле ctf-agent: ``verdict.correct``).
+
+    Поля:
+        status:   ``correct`` / ``incorrect`` / ``already_solved`` / ``partial``
+                  / ``ratelimited`` / ``authentication_required`` / ``paused`` / ...
+        message:  сопроводительное сообщение сервера (напр. число оставшихся попыток)
+        raw:      исходный payload (включая ``data`` целиком, если есть)
+    """
+
+    @property
+    def status(self) -> str:
+        return self.get("status", "unknown")
+
+    @property
+    def message(self) -> str:
+        return self.get("message", "") or ""
+
+    @property
+    def correct(self) -> bool:
+        """Флаг засчитан (включая ``already_solved`` — повторная отправка не нужна)."""
+        return self.status in ("correct", "already_solved")
+
+    @property
+    def already_solved(self) -> bool:
+        return self.status == "already_solved"
+
+    @property
+    def ratelimited(self) -> bool:
+        return self.status == "ratelimited"
+
+    @property
+    def incorrect(self) -> bool:
+        return self.status == "incorrect"
+
+    def __repr__(self) -> str:
+        return f"SubmitResult(status={self.status!r}, message={self.message!r})"
+
+
 class CTfdClient:
     """Клиент player-эндпоинтов инстанса CTFd."""
 
@@ -109,12 +620,25 @@ class CTfdClient:
         *,
         timeout: float = 30.0,
         session: Optional[requests.Session] = None,
+        bridge: Optional[str] = None,
     ):
         self.host = host.rstrip("/")
         self.timeout = timeout
         self.session = session or requests.Session()
         self._nonce: Optional[str] = None
         self._active_ws: Optional[Path] = None
+        # Транспорт: "auto" (по умолчанию; requests, при CloudflareBlocked
+        # прозрачно переключаемся на CDP-мост), "cdp" (только мост),
+        # "off"/"requests" (только requests). Env: CTFD_BRIDGE.
+        mode = (bridge or os.environ.get("CTFD_BRIDGE") or "auto").strip().lower()
+        if mode == "requests":
+            mode = "off"
+        if mode not in ("auto", "cdp", "off"):
+            raise CTfdError(
+                f"Неизвестный bridge-режим: {mode!r} (ожидается auto|cdp|off)."
+            )
+        self._bridge_mode: str = mode
+        self._bridge: Optional[CDPBridge] = None
         if token:
             # Авторизация токеном: заголовок Authorization + JSON Content-Type.
             # Запрос с Authorization полностью обходит CSRF.
@@ -204,6 +728,113 @@ class CTfdClient:
             return {"CSRF-Token": self._nonce}
         return {}
 
+    # ------------------------------------------------------------------
+    #  Транспорт: CDP-мост или requests (+ Cloudflare-автопереключение)
+    # ------------------------------------------------------------------
+    def _raw_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Any] = None,
+        data: Optional[Any] = None,
+        binary: bool = False,
+    ) -> Any:
+        """Единая транспортная точка: CDP-мост или requests.Session.
+
+        Возвращает response-объект с общим интерфейсом (см.
+        ``_BridgeResponse``). В режиме ``cdp`` мост инициализируется лениво
+        (при первом запросе). ``binary`` актуален только для моста
+        (base64-транспорт файлов).
+        """
+        if self._bridge is not None or self._bridge_mode == "cdp":
+            return self._bridge_http(
+                method, url, json_body=json_body, data=data, binary=binary
+            )
+        kwargs: Dict[str, Any] = {"timeout": self.timeout, "headers": {}}
+        if method.upper() in _WRITE_METHODS:
+            kwargs["headers"].update(self._headers_for_write())
+        if params:
+            kwargs["params"] = params
+        if json_body is not None:
+            kwargs["json"] = json_body
+        elif data is not None:
+            kwargs["data"] = data
+        try:
+            return self.session.request(method, url, **kwargs)
+        except requests.RequestException as e:
+            raise CTfdError(f"Ошибка запроса: {e}") from e
+
+    def _bridge_http(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: Optional[Any] = None,
+        data: Optional[Any] = None,
+        binary: bool = False,
+    ) -> _BridgeResponse:
+        """Выполнить запрос через CDP-мост и нормализовать ответ."""
+        if self._bridge is None:
+            self._bridge = CDPBridge(host=self.host, timeout=self.timeout)
+            self._bridge.connect()
+        if data is not None:
+            raise CTfdError(
+                "bridge-транспорт не поддерживает form-data (userpass-логин "
+                "через мост). Авторизуйтесь в браузере или используйте API-токен."
+            )
+        headers: Dict[str, str] = {}
+        auth = self.session.headers.get("Authorization")
+        if auth:
+            headers["Authorization"] = auth
+        body: Optional[str] = None
+        if json_body is not None:
+            body = json.dumps(json_body)
+            headers.setdefault("Content-Type", "application/json")
+        res = self._bridge.http(
+            method.upper(), url, headers=headers, body=body, binary=binary
+        )
+        content = (
+            base64.b64decode(res["body"])
+            if binary
+            else (res["body"] or "").encode("utf-8")
+        )
+        return _BridgeResponse(
+            status=int(res.get("status") or 0),
+            content=content,
+            url=url,
+            content_type=res.get("ct", ""),
+        )
+
+    def _maybe_switch_to_bridge(self) -> bool:
+        """Попробовать перейти на CDP-мост (режим auto), один раз за сессию."""
+        if self._bridge is not None or self._bridge_mode == "off":
+            return False
+        try:
+            bridge = CDPBridge(host=self.host, timeout=self.timeout)
+            bridge.connect()
+        except Exception as e:
+            print(f"[ctfd] CDP bridge unavailable: {e}", file=sys.stderr)
+            return False
+        self._bridge = bridge
+        tab = (bridge.target or {}).get("url", "?")
+        print(
+            f"[ctfd] Cloudflare detected -> switched to CDP bridge "
+            f"(tab: {str(tab)[:80]})",
+            file=sys.stderr,
+        )
+        return True
+
+    @staticmethod
+    def _is_cloudflare(r: Any) -> bool:
+        return _looks_like_cloudflare(r)
+
+    @staticmethod
+    def _cf_message(r: Any) -> str:
+        sc = getattr(r, "status_code", "?")
+        return f"HTTP {sc}: {_CF_HINT}"
+
     def _request(
         self,
         method: str,
@@ -216,20 +847,25 @@ class CTfdClient:
         allow_404_none: bool = False,
     ) -> Any:
         url = self._url(path)
-        kwargs: Dict[str, Any] = {"timeout": self.timeout, "headers": {}}
-        if method.upper() in _WRITE_METHODS:
-            kwargs["headers"].update(self._headers_for_write())
-        if params:
-            kwargs["params"] = params
-        if json_body is not None:
-            kwargs["json"] = json_body
-        elif data is not None:
-            kwargs["data"] = data
+        r = self._raw_request(
+            method, url, params=params, json_body=json_body, data=data
+        )
 
-        try:
-            r = self.session.request(method, url, **kwargs)
-        except requests.RequestException as e:
-            raise CTfdError(f"Ошибка запроса: {e}") from e
+        # Cloudflare-челлендж: прозрачный переход на CDP-мост (auto) или
+        # внятная ошибка вместо тонны сырого HTML.
+        if self._is_cloudflare(r):
+            if self._maybe_switch_to_bridge():
+                r = self._raw_request(
+                    method, url, params=params, json_body=json_body, data=data
+                )
+            if self._is_cloudflare(r):
+                if self._bridge is not None:
+                    raise CloudflareBlocked(
+                        "CDP-вкладка тоже получает CF-челлендж — откройте "
+                        "CTFd-хост в браузере и пройдите проверку Cloudflare "
+                        "вручную, затем повторите."
+                    )
+                raise CloudflareBlocked(self._cf_message(r))
 
         if r.status_code == 429 and retry:
             wait = self._parse_retry_seconds(r)
@@ -248,6 +884,33 @@ class CTfdClient:
 
         if r.status_code == 404 and allow_404_none:
             return None
+        # Session-auth: CSRF nonce мог протухнуть. Рефетчим с /challenges и
+        # ретраим запрос один раз (только без Authorization, только для записи).
+        if (
+            r.status_code == 403
+            and retry
+            and "Authorization" not in self.session.headers
+            and method.upper() in _WRITE_METHODS
+        ):
+            new_nonce: Optional[str] = None
+            try:
+                page = self.session.get(
+                    f"{self.host}/challenges", timeout=self.timeout
+                )
+                new_nonce = self._scrape_nonce(page.text)
+            except requests.RequestException:
+                new_nonce = None
+            if new_nonce and new_nonce != self._nonce:
+                self._nonce = new_nonce
+                return self._request(
+                    method,
+                    path,
+                    params=params,
+                    json_body=json_body,
+                    data=data,
+                    retry=False,
+                    allow_404_none=allow_404_none,
+                )
         if r.status_code == 401:
             raise CTfdError(f"Не авторизован (HTTP 401): {self._safe_text(r)}")
         if not r.ok:
@@ -307,6 +970,66 @@ class CTfdClient:
         return None
 
     @staticmethod
+    def _html_to_markdown(html: Optional[str]) -> str:
+        """Конвертировать HTML-описание задачи в Markdown.
+
+        Предпочитает ``markdownify`` (точная конвертация, как у ctf-agent),
+        при её отсутствии — лёгкий regex-strip без внешних зависимостей
+        (lossy, но достаточно для чтения агентом). ``None``/empty → заглушка.
+        """
+        if not html:
+            return "(описание отсутствует)"
+        try:
+            from markdownify import markdownify as _md
+
+            return _md(html).strip() or "(описание отсутствует)"
+        except ImportError:
+            pass
+        # Fallback: лёгкий strip без внешних зависимостей.
+        out = html
+        out = re.sub(r"<br\s*/?>", "\n", out, flags=re.IGNORECASE)
+        out = re.sub(r"</(p|div|li|h[1-6])>", "\n\n", out, flags=re.IGNORECASE)
+        out = re.sub(r"<li[^>]*>", "- ", out, flags=re.IGNORECASE)
+        out = re.sub(r"<code[^>]*>(.*?)</code>", r"`\1`", out, flags=re.IGNORECASE | re.DOTALL)
+        out = re.sub(r"<pre[^>]*>(.*?)</pre>", r"\n```\n\1\n```\n", out, flags=re.IGNORECASE | re.DOTALL)
+        out = re.sub(r"<h([1-6])[^>]*>", lambda m: "\n\n" + "#" * int(m.group(1)) + " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", r"[\2](\1)", out, flags=re.IGNORECASE | re.DOTALL)
+        out = _HTML_TAG_RE.sub("", out)
+        out = re.sub(r"&nbsp;", " ", out)
+        out = re.sub(r"&amp;", "&", out)
+        out = re.sub(r"&lt;", "<", out)
+        out = re.sub(r"&gt;", ">", out)
+        out = re.sub(r"&quot;", '"', out)
+        out = re.sub(r"&#39;", "'", out)
+        return re.sub(r"\n{3,}", "\n\n", out).strip() or "(описание отсутствует)"
+
+    @classmethod
+    def _extract_connection_info(
+        cls,
+        description: Optional[str],
+        explicit: Optional[str] = None,
+    ) -> Optional[str]:
+        """Серверное ``connection_info`` имеет приоритет; иначе — regex-извлечение
+        из описания (``nc host port`` / ``ncat`` / ``ssh`` / URL). Возвращает
+        уникальные совпадения через ``\\n`` либо ``None``.
+        """
+        if explicit:
+            return explicit
+        if not description:
+            return None
+        text = cls._html_to_markdown(description) if "<" in description else description
+        hits: List[str] = []
+        seen: set = set()
+        for pat in _CONN_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(0).strip().rstrip(".,;:)")
+                key = val.lower()
+                if key not in seen:
+                    seen.add(key)
+                    hits.append(val)
+        return "\n".join(hits) if hits else None
+
+    @staticmethod
     def _parse_retry_seconds(response: requests.Response) -> Optional[int]:
         try:
             data = response.json()
@@ -329,6 +1052,34 @@ class CTfdClient:
         except ValueError:
             return response.text[:300]
 
+    # -- httpx-варианты тех же хелперов (используются AsyncCTfdClient) -----
+    @staticmethod
+    def _parse_retry_seconds_httpx(response: Any) -> Optional[int]:
+        """То же, что ``_parse_retry_seconds``, но для httpx.Response."""
+        try:
+            data = response.json()
+        except Exception:
+            return None
+        msg = ""
+        if isinstance(data, dict):
+            inner = data.get("data")
+            if isinstance(inner, dict):
+                msg = inner.get("message", "")
+            if not msg:
+                msg = data.get("message", "")
+        m = _SEC_RE.search(msg or "")
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def _safe_text_httpx(response: Any) -> Any:
+        try:
+            return response.json()
+        except Exception:
+            try:
+                return response.text[:300]
+            except Exception:
+                return None
+
     # ==================================================================
     #  Player-эндпоинты
     # ==================================================================
@@ -337,9 +1088,23 @@ class CTfdClient:
         *,
         update_seen: bool = True,
         poll_notifications: bool = True,
+        detail: str = "list",
+        max_workers: int = 8,
         **filters: Any,
     ) -> List[Dict[str, Any]]:
-        """Список челленджей (id, name, category, value, solves, solved_by_me).
+        """Список челленджей.
+
+        Режимы ``detail``:
+            - ``"list"`` (по умолчанию): лёгкий список одной кнопкой
+              (id, name, category, value, solves, solved_by_me). 1 запрос.
+              Удобен для быстрого обзора «что вообще есть» — особенно на CTF
+              со 100+ задачами.
+            - ``"full"``: для каждой задачи в списке догружает полное условие
+              (description, files, hints, tags) через ``GET /challenges/<id>``.
+              Параллельно через пул потоков (``max_workers``, по умолчанию 8).
+              Итог — список с полями из detail endpoint'а. Полезно для triage
+              «по каким задачам у меня уже есть идеи» — agent получает всё
+              одним вызовом вместо N ручных ``get_challenge(id)``.
 
         Заодно — единая точка «что нового»:
 
@@ -359,6 +1124,8 @@ class CTfdClient:
         «тихого» обзора (без записи состояния).
         """
         data = self._request("GET", "/challenges", params=filters or None)
+        if detail == "full":
+            data = self._fetch_full_challenges(data, max_workers=max_workers)
         if update_seen or poll_notifications:
             # Одна загрузка и одно сохранение .seen.json на вызов (раньше
             # _diff_new_challenges и _poll_notifications сохраняли каждый).
@@ -372,6 +1139,53 @@ class CTfdClient:
             self._save_seen(seen)
         return data
 
+    def _fetch_full_challenges(
+        self,
+        stubs: List[Dict[str, Any]],
+        *,
+        max_workers: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Для каждого stub'а догружает полный detail через GET /challenges/<id>.
+
+        Параллельно через ThreadPoolExecutor.Stub-поля (id/name/category/...)
+        сохраняются; при конфликте приоритет у detail (более свежий).
+        Ошибки отдельных задач печатаются в stderr и не рвут поток —
+        соответствующий stub просто возвращается как есть.
+        """
+        if not stubs:
+            return stubs
+        max_workers = max(1, min(32, int(max_workers)))
+        results: Dict[int, Dict[str, Any]] = {}
+
+        def _one(stub: Dict[str, Any]) -> None:
+            cid = stub.get("id")
+            if cid is None:
+                return
+            try:
+                results[int(cid)] = self.get_challenge(int(cid))
+            except Exception as e:  # pragma: no cover - best-effort
+                print(
+                    f"[ctfd] _fetch_full_challenges: challenge {cid}: {e}",
+                    file=sys.stderr,
+                )
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(_one, stubs))
+        # Сохраняем порядок исходного списка; мерджим stub + detail.
+        out: List[Dict[str, Any]] = []
+        for stub in stubs:
+            cid = int(stub.get("id") or -1)
+            full = results.get(cid)
+            if full:
+                merged = dict(stub)
+                merged.update(full)
+                out.append(merged)
+            else:
+                out.append(stub)
+        return out
+
     def get_challenge(self, challenge_id: int) -> Dict[str, Any]:
         """Полное условие: описание, connection_info, файлы, теги, хинты."""
         return self._request("GET", f"/challenges/{challenge_id}")
@@ -380,15 +1194,35 @@ class CTfdClient:
         """Кто решил задачу (учитывает заморозку скоринга)."""
         return self._request("GET", f"/challenges/{challenge_id}/solves")
 
-    def attempt(self, challenge_id: int, submission: str) -> Dict[str, Any]:
-        """Подать флаг. Возвращает вердикт вида::
+    def attempt(
+        self,
+        challenge_id: int,
+        submission: str,
+        *,
+        verify_score: bool = True,
+    ) -> SubmitResult:
+        """Подать флаг. Возвращает :class:`SubmitResult` (dict-совместимый).
 
-            {"status": "correct"|"incorrect"|"already_solved"|"partial"|
-                       "ratelimited"|"authentication_required"|"paused"|...,
-             "message": "..."}
+        Вердикт:::
+
+            SubmitResult({
+                "status": "correct"|"incorrect"|"already_solved"|"partial"|
+                           "ratelimited"|"authentication_required"|"paused"|...,
+                "message": "...",
+                ...остальные поля data...
+            })
+
+        Удобные property: ``verdict.correct``, ``verdict.already_solved``,
+        ``verdict.ratelimited``. Dict-dostup ``verdict["status"]`` тоже работает.
 
         429 ratelimited обрабатывается автоматически (один повтор после ожидания
         числа секунд из сообщения).
+
+        ``verify_score=True`` (по умолчанию): после ``correct``/
+        ``already_solved`` — дешёвая сверка с ``GET /users/me/solves``;
+        результат в ``verdict["scored"]`` (True/False; ключа нет, если
+        проверить не удалось). ``correct ≠ «попало в скор»`` при заморозке
+        скоринга — при расхождении печатается warning и пишется в NOTES.md.
 
         Побочные эффекты (best-effort, НИКОГДА не рвут сабмит):
         - автоматически дописывает запись в ``NOTES.md`` активной задачи;
@@ -403,8 +1237,52 @@ class CTfdClient:
         )
         if isinstance(data, dict) and "status" in data:
             self._autolog_attempt(challenge_id, submission, data)
-            return data
-        return {"status": "unknown", "data": data}
+            result = SubmitResult(data)
+            if result.correct and verify_score:
+                scored = self._verify_scored(challenge_id)
+                self._note_score(challenge_id, result, scored)
+            return result
+        return SubmitResult(status="unknown", data=data)
+
+    def _verify_scored(self, challenge_id: int) -> Optional[bool]:
+        """Дешёвая проверка попадания сабмита в скор (GET /users/me/solves).
+
+        ``None`` — проверить не удалось (сеть/ошибка), тихо пропускаем.
+        """
+        try:
+            solves = self.my_solves() or []
+        except Exception as e:
+            print(f"[ctfd] score verification skipped: {e}", file=sys.stderr)
+            return None
+        cid = int(challenge_id)
+        return any(
+            s.get("challenge_id") is not None and int(s["challenge_id"]) == cid
+            for s in solves
+            if isinstance(s, dict)
+        )
+
+    def _note_score(
+        self,
+        challenge_id: int,
+        result: SubmitResult,
+        scored: Optional[bool],
+    ) -> None:
+        """Записать результат сверки в SubmitResult (+warning при расхождении)."""
+        if scored is None:
+            return
+        result["scored"] = scored
+        if scored:
+            return
+        msg = (
+            "correct, но solve НЕ виден в /users/me/solves — вероятна "
+            "заморозка скоринга (freeze) или задержка учёта. Сверьте позже: "
+            "CLI solves / status."
+        )
+        print(f"[ctfd] WARNING: {msg}", file=sys.stderr)
+        try:
+            self.log_attempt(challenge_id, msg, "tried", _silent=True)
+        except Exception:
+            pass
 
     def get_hint(self, hint_id: int, preview: bool = False) -> Dict[str, Any]:
         """Показать хинт (content виден только если хинт разблокирован)."""
@@ -429,6 +1307,56 @@ class CTfdClient:
 
     def unlock_solution(self, solution_id: int) -> Any:
         return self.unlock("solutions", solution_id)
+
+    def unlock_free_hints(
+        self, challenge_or_hints: Any
+    ) -> List[int]:
+        """Разблокировать все бесплатные хинты (cost <= 0).
+
+        Принимает либо ``detail`` от :meth:`get_challenge` (тогда берёт
+        ``detail['hints']``), либо готовый список hint-stub'ов.
+        Для каждого stub'а при отсутствии ``cost`` делает ``GET /hints/<id>``
+        (``preview=true``) — полный list-challenge иногда не отдаёт cost.
+        Возвращает список id разблокированных хинтов. Best-effort: ошибки
+        отдельных хинтов печатаются в stderr и не рвут поток.
+        """
+        if isinstance(challenge_or_hints, dict):
+            hint_stubs = challenge_or_hints.get("hints") or []
+        else:
+            hint_stubs = list(challenge_or_hints or [])
+        unlocked: List[int] = []
+        for stub in hint_stubs:
+            try:
+                hid = stub.get("id") if isinstance(stub, dict) else None
+                if hid is None:
+                    continue
+                cost = stub.get("cost") if isinstance(stub, dict) else None
+                if cost is None:
+                    detail = self._request(
+                        "GET", f"/hints/{hid}", params={"preview": "true"}
+                    )
+                    cost = (
+                        detail.get("cost", 0) if isinstance(detail, dict) else 0
+                    )
+                if cost is not None and int(cost) <= 0:
+                    try:
+                        self.unlock_hint(int(hid))
+                        unlocked.append(int(hid))
+                    except CTfdError as e:
+                        # Уже разблокирован (400 'already') — ожидаемо, не шумим.
+                        if "already" not in str(e).lower():
+                            print(
+                                f"[ctfd] unlock_free_hints: hint {hid}: {e}",
+                                file=sys.stderr,
+                            )
+                        else:
+                            unlocked.append(int(hid))
+            except Exception as e:
+                print(
+                    f"[ctfd] unlock_free_hints: stub {stub!r}: {e}",
+                    file=sys.stderr,
+                )
+        return unlocked
 
     def scoreboard(self) -> List[Dict[str, Any]]:
         return self._request("GET", "/scoreboard")
@@ -501,11 +1429,20 @@ class CTfdClient:
                 f"сохранить оба — переименуйте или задайте dest_dir.",
                 file=sys.stderr,
             )
-        with self.session.get(url, stream=True, timeout=self.timeout) as r:
-            r.raise_for_status()
-            with open(out, "wb") as fh:
-                for chunk in r.iter_content(8192):
-                    fh.write(chunk)
+        # Единый транспорт (мост/requests) + Cloudflare-детект.
+        r = self._raw_request("GET", url, binary=True)
+        if self._is_cloudflare(r):
+            if self._maybe_switch_to_bridge():
+                r = self._raw_request("GET", url, binary=True)
+            if self._is_cloudflare(r):
+                raise CloudflareBlocked(self._cf_message(r))
+        if r.status_code == 429:
+            raise RateLimited(self._safe_text(r), retry_in=None)
+        if 400 <= r.status_code < 600:
+            raise CTfdError(
+                f"HTTP {r.status_code} GET {url}: {self._safe_text(r)}"
+            )
+        out.write_bytes(r.content)
         return out
 
     # -- персистентный CTF-воркспейс -------------------------------
@@ -513,6 +1450,8 @@ class CTfdClient:
         self,
         challenge: Dict[str, Any],
         base: str = "~/Downloads/ctf",
+        *,
+        auto_unlock_free_hints: bool = False,
     ) -> Path:
         """Создать персистентный воркспейс для задачи и вернуть путь.
 
@@ -520,7 +1459,7 @@ class CTfdClient:
 
             <base>/<event>/<category>/<slug>/
             ├── challenge.json      метаданные CTFd (id, name, host, ...)
-            ├── description.md      условие задачи
+            ├── description.md      условие задачи (HTML→Markdown)
             ├── attachments/        скачанные файлы
             ├── scripts/            самописные solve-скрипты (запускать отсюда)
             └── NOTES.md            журнал хода решения (append)
@@ -528,6 +1467,12 @@ class CTfdClient:
         ``event`` выводится из host (напр. ``ctf.example.com`` → ``example-2026``);
         override через env ``CTFD_EVENT``. Воркспейс переживает ребуты
         (по умолчанию в ``~/Downloads/ctf``).
+
+        Параметры:
+            auto_unlock_free_hints: разблокировать бесплатные хинты (cost<=0)
+                автоматически — максимум контекста агенту без трат баллов
+                (идея из ctf-agent/pull_challenges.py). Опционально, по умолчанию
+                OFF. Платные хинты НЕ трогаются.
         """
         base_path = Path(os.path.expanduser(base))
         event = os.environ.get("CTFD_EVENT") or self._derive_event_slug()
@@ -549,7 +1494,9 @@ class CTfdClient:
             "name": challenge.get("name"),
             "category": challenge.get("category"),
             "value": challenge.get("value"),
-            "connection_info": challenge.get("connection_info"),
+            "connection_info": self._extract_connection_info(
+                challenge.get("description"), challenge.get("connection_info")
+            ),
             "host": self.host,
             "event": event,
             "solved": solved,
@@ -562,7 +1509,8 @@ class CTfdClient:
         desc = ws / "description.md"
         if not desc.exists():
             desc.write_text(
-                challenge.get("description") or "(описание отсутствует)", encoding="utf-8"
+                self._html_to_markdown(challenge.get("description")),
+                encoding="utf-8",
             )
         notes = ws / "NOTES.md"
         if not notes.exists():
@@ -573,6 +1521,41 @@ class CTfdClient:
                 "Записи: `## [ISO-ts] status` → гипотеза/действие/результат.\n\n",
                 encoding="utf-8",
             )
+
+        # Шаблон solve.py по категории задачи (pwnv-style). Создаётся только при
+        # отсутствии — не затирает пользовательские правки. Пользовательские
+        # шаблоны в ~/.config/ctfd/templates/ переопределяют встроенные.
+        solve_py = ws / "scripts" / "solve.py"
+        if not solve_py.exists():
+            cat_raw = str(challenge.get("category") or "").lower()
+            tmpl = _solve_template_for(cat_raw) or _DEFAULT_TEMPLATES[_DEFAULT_CATEGORY]
+            ctx = {
+                "name": str(challenge.get("name") or challenge.get("id") or "challenge"),
+                "slug": slug,
+                "host": self.host.replace("https://", "").replace("http://", "").rstrip("/"),
+                "connection_info": meta.get("connection_info") or "",
+                "flag_prefix": "flag{...}",
+            }
+            try:
+                solve_py.write_text(_render_template(tmpl, ctx), encoding="utf-8")
+            except Exception as e:  # pragma: no cover - best-effort
+                print(f"[ctfd] init_challenge_workspace: solve.py template: {e}", file=sys.stderr)
+
+        # Опциональный auto-unlock бесплатных хинтов — после того, как воркспейс
+        # полностью создан, чтобы неудача unlock не оставила половинчатый scaffold.
+        if auto_unlock_free_hints and challenge.get("hints"):
+            try:
+                freed = self.unlock_free_hints(challenge)
+                if freed:
+                    self.log_attempt(
+                        int(challenge.get("id") or 0),
+                        f"авто-unlock бесплатных хинтов: {freed}",
+                        "tried",
+                        _silent=True,
+                        _ws=ws,
+                    )
+            except Exception as e:  # pragma: no cover - best-effort
+                print(f"[ctfd] auto_unlock_free_hints: {e}", file=sys.stderr)
 
         self._active_ws = ws
         return ws
@@ -878,6 +1861,51 @@ class CTfdClient:
     # ------------------------------------------------------------------
     #  Сводка по воркспейсам + сверка/синхронизация с сервером
     # ------------------------------------------------------------------
+    def list_events(self, base: str = "~/Downloads/ctf") -> List[Dict[str, Any]]:
+        """Список событий под базой воркспейсов — детектор «расползания» деревьев.
+
+        Показывает каждое ``<base>/<event>/`` с числом воркспейсов и solved.
+        Параллельные деревья одного события (например ``event-2026`` и
+        ``2026-event`` — плод субагентов без канонического ``CTFD_EVENT``)
+        видны сразу. Оффлайн, без обращения к серверу.
+        """
+        base_path = Path(os.path.expanduser(base))
+        out: List[Dict[str, Any]] = []
+        if not base_path.exists():
+            return out
+        for d in sorted(base_path.iterdir(), key=lambda p: p.name):
+            if not d.is_dir():
+                continue
+            dirs = {
+                mf.parent
+                for name in _META_FILES
+                for mf in d.rglob(name)
+            }
+            solved = 0
+            host: Optional[str] = None
+            for wd in dirs:
+                meta = self._read_meta(wd)
+                if meta.get("solved"):
+                    solved += 1
+                if host is None and meta.get("host"):
+                    host = str(meta["host"])
+            try:
+                mtime = time.strftime(
+                    "%Y-%m-%dT%H:%M:%S", time.localtime(d.stat().st_mtime)
+                )
+            except OSError:
+                mtime = ""
+            out.append(
+                {
+                    "event": d.name,
+                    "workspaces": len(dirs),
+                    "solved": solved,
+                    "host": host,
+                    "modified": mtime,
+                }
+            )
+        return out
+
     def workspace_status(
         self,
         event: Optional[str] = None,
@@ -1046,6 +2074,525 @@ class CTfdClient:
 
 
 # ====================================================================
+#  Async-клиент (httpx.AsyncClient) — для параллельной скачки и triage
+# ====================================================================
+class AsyncCTfdClient:
+    """Асинхронная версия :class:`CTfdClient` на ``httpx.AsyncClient``.
+
+    Идея — параллельные операции на больших CTF (массовая скачка файлов,
+    ``list_challenges(detail="full")`` через ``asyncio.gather``, обход задач
+    на triage). Полностью раздельный класс: ``httpx`` — опциональная
+    зависимость, импортируется лениво только при создании ``AsyncCTfdClient``.
+
+    API зеркалит синхронный: каждый HTTP-метод — coroutine. Workspace-методы
+    (``init_challenge_workspace``, ``log_attempt``, ``download_file`` и т.д.)
+    делегируют в общий экземпляр :class:`CTfdClient`, потому что они делают
+    локальный file I/O — нет смысла их асинхронизировать. Один объект на оба:
+    async-HTTP + sync-file-IO. Это сознательный компромисс для простоты.
+
+    Использование::
+
+        import asyncio
+        from ctfd_client import AsyncCTfdClient
+
+        async def main():
+            c = AsyncCTfdClient("https://ctf.example.com", token="ctfd_...")
+            chals = await c.list_challenges(detail="full")  # параллельный fetch
+            for f in chals[0]["files"]:
+                await c.download_file(f)  # async-скачка
+            verdict = await c.attempt(42, "flag{x}")
+
+        asyncio.run(main())
+    """
+
+    def __init__(
+        self,
+        host: str,
+        token: Optional[str] = None,
+        *,
+        timeout: float = 30.0,
+    ):
+        try:
+            import httpx  # noqa: F401  — проверяем доступность
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "AsyncCTfdClient требует httpx: pip install httpx"
+            ) from e
+        self.host = host.rstrip("/")
+        self.timeout = timeout
+        # Sync-делегат для workspace-операций (init/log/download_file sync-вариант
+        # не требует requests-сессии для file-I/O, но переиспользуем логику).
+        self._sync_delegate = CTfdClient(host, token=token, timeout=timeout)
+        # httpx-session создаётся лениво при первом запросе.
+        self._client: Optional["httpx.AsyncClient"] = None
+        self._token = token
+        self._nonce: Optional[str] = self._sync_delegate._nonce
+
+    @classmethod
+    def from_env(cls, **kwargs: Any) -> "AsyncCTfdClient":
+        host = kwargs.pop("host", None) or os.environ.get(CTFD_HOST_ENV)
+        token = kwargs.pop("token", None) or os.environ.get(CTFD_TOKEN_ENV)
+        if not host:
+            raise CTfdError(f"Хост не задан: укажите аргумент или ${CTFD_HOST_ENV}.")
+        return cls(host, token=token, **kwargs)
+
+    @classmethod
+    async def from_userpass(
+        cls,
+        host: str,
+        name: str,
+        password: str,
+        *,
+        timeout: float = 30.0,
+    ) -> "AsyncCTfdClient":
+        """Async-логин по паролю (form-post + CSRF)."""
+        import httpx
+
+        c = cls(host, token=None, timeout=timeout)
+        c._client = httpx.AsyncClient(
+            base_url=c.host, timeout=timeout, follow_redirects=False
+        )
+        # bootstrap nonce: GET /login
+        r = await c._client.get("/login")
+        c._nonce = CTfdClient._scrape_nonce(r.text)
+        if not c._nonce:
+            raise CTfdError("Не удалось извлечь CSRF nonce из /login")
+        data = {"name": name, "password": password, "nonce": c._nonce}
+        r = await c._client.post(
+            "/login",
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if r.status_code not in (301, 302):
+            raise CTfdError(
+                f"Не удалось войти (HTTP {r.status_code}). Проверьте учётные данные."
+            )
+        # Рефетчим nonce для последующих API-записей
+        page = await c._client.get("/challenges")
+        c._nonce = CTfdClient._scrape_nonce(page.text)
+        if not c._nonce:
+            raise CTfdError(
+                "Не удалось получить CSRF nonce после входа. Используйте API-токен."
+            )
+        c._sync_delegate._nonce = c._nonce
+        return c
+
+    async def __aenter__(self) -> "AsyncCTfdClient":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    # ------------------------------------------------------------------
+    #  Низкоуровневый async-запрос
+    # ------------------------------------------------------------------
+    def _ensure_client(self) -> "httpx.AsyncClient":
+        if self._client is None:
+            import httpx
+
+            headers: Dict[str, str] = {}
+            if self._token:
+                headers["Authorization"] = f"Token {self._token}"
+                headers["Content-Type"] = "application/json"
+            self._client = httpx.AsyncClient(
+                base_url=self.host, timeout=self.timeout, headers=headers,
+                follow_redirects=False,
+            )
+        return self._client
+
+    def _url(self, path: str) -> str:
+        if path.startswith(("http://", "https://")):
+            return path
+        if not path.startswith("/"):
+            path = "/" + path
+        if path.startswith(API_PREFIX):
+            return path
+        return f"{API_PREFIX}{path}"
+
+    def _headers_for_write(self) -> Dict[str, str]:
+        if self._nonce and self._token is None:
+            return {"CSRF-Token": self._nonce}
+        return {}
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Any] = None,
+        data: Optional[Any] = None,
+        retry: bool = True,
+        allow_404_none: bool = False,
+    ) -> Any:
+        import asyncio
+        import httpx
+
+        # Bridge-режим: весь HTTP уходит через CDP-мост sync-делегата
+        # (to_thread). httpx при CF-хосте бесполезен.
+        if (
+            self._sync_delegate._bridge is not None
+            or self._sync_delegate._bridge_mode == "cdp"
+        ):
+            return await asyncio.to_thread(
+                self._sync_delegate._request,
+                method, path,
+                params=params, json_body=json_body, data=data,
+                retry=retry, allow_404_none=allow_404_none,
+            )
+
+        client = self._ensure_client()
+        url = self._url(path)
+        headers: Dict[str, str] = {}
+        if method.upper() in _WRITE_METHODS:
+            headers.update(self._headers_for_write())
+        try:
+            r = await client.request(method, url, params=params, json=json_body,
+                                     data=data, headers=headers or None)
+        except httpx.HTTPError as e:
+            raise CTfdError(f"Ошибка запроса: {e}") from e
+
+        # Cloudflare: пробуем переключиться на CDP-мост через sync-делегата
+        # и повторить запрос уже через него; не вышло — внятная ошибка.
+        if self._sync_delegate._is_cloudflare(r):
+            switched = await asyncio.to_thread(
+                self._sync_delegate._maybe_switch_to_bridge
+            )
+            if switched:
+                return await asyncio.to_thread(
+                    self._sync_delegate._request,
+                    method, path,
+                    params=params, json_body=json_body, data=data,
+                    retry=retry, allow_404_none=allow_404_none,
+                )
+            raise CloudflareBlocked(self._sync_delegate._cf_message(r))
+
+        # 429 — backoff как в sync-клиенте
+        if r.status_code == 429 and retry:
+            wait = self._sync_delegate._parse_retry_seconds_httpx(r)
+            if wait:
+                import asyncio
+                await asyncio.sleep(wait + 1)
+                return await self._request(
+                    method, path, params=params, json_body=json_body, data=data,
+                    retry=False, allow_404_none=allow_404_none,
+                )
+            raise RateLimited(self._sync_delegate._safe_text_httpx(r), retry_in=wait)
+
+        if r.status_code == 404 and allow_404_none:
+            return None
+        # 403 + session-auth → refresh nonce + retry once
+        if (
+            r.status_code == 403 and retry and self._token is None
+            and method.upper() in _WRITE_METHODS
+        ):
+            try:
+                page = await client.get("/challenges")
+                new_nonce = self._sync_delegate._scrape_nonce(page.text)
+            except httpx.HTTPError:
+                new_nonce = None
+            if new_nonce and new_nonce != self._nonce:
+                self._nonce = new_nonce
+                return await self._request(
+                    method, path, params=params, json_body=json_body, data=data,
+                    retry=False, allow_404_none=allow_404_none,
+                )
+        if r.status_code == 401:
+            raise CTfdError(f"Не авторизован (HTTP 401): {self._sync_delegate._safe_text_httpx(r)}")
+        if not r.is_success:
+            raise CTfdError(
+                f"HTTP {r.status_code} {method} {path}: {self._sync_delegate._safe_text_httpx(r)}"
+            )
+        if r.status_code == 204 or not r.content:
+            return None
+        ctype = r.headers.get("Content-Type", "")
+        if "html" in ctype.lower() and "/login" in str(r.url).lower():
+            raise CTfdError(
+                "Требуется авторизация: запрос перенаправлен на страницу входа. "
+                "Укажите действительный API-токен или выполните вход."
+            )
+        try:
+            payload = r.json()
+        except ValueError:
+            if "html" in ctype.lower():
+                raise CTfdError(
+                    f"Ожидался JSON, получен HTML. final_url={r.url} "
+                    "(вероятно, неавторизованный доступ или неверный путь)."
+                )
+            return r.content
+        if isinstance(payload, dict) and "success" in payload:
+            if not payload.get("success"):
+                raise CTfdError(
+                    f"Ошибка API: {json.dumps(payload.get('errors') or payload)[:500]}"
+                )
+            return payload.get("data", payload)
+        return payload
+
+    # ------------------------------------------------------------------
+    #  Async-эквиваленты player-эндпоинтов
+    # ------------------------------------------------------------------
+    async def list_challenges(
+        self,
+        *,
+        update_seen: bool = False,
+        poll_notifications: bool = False,
+        detail: str = "list",
+        **filters: Any,
+    ) -> List[Dict[str, Any]]:
+        """Async list_challenges. ``detail="full"`` параллельно через asyncio.gather.
+
+        По умолчанию без side-effects (``update_seen``/``poll_notifications``
+       _OFF_), потому что async обычно используется для batch-операций, а не
+        интерактивного «что нового». Для включения — передайте явно.
+        """
+        data = await self._request("GET", "/challenges", params=filters or None)
+        if detail == "full":
+            data = await self._fetch_full_challenges(data)
+        if update_seen or poll_notifications:
+            import asyncio
+            # Перенесём side-effects в поток — они синхронны внутри sync-делегата.
+            def _side() -> List[Dict[str, Any]]:
+                seen = self._sync_delegate._load_seen()
+                if update_seen:
+                    seen = self._sync_delegate._diff_new_challenges(
+                        data, filtered=bool(filters), seen=seen
+                    )
+                if poll_notifications:
+                    seen = self._sync_delegate._poll_notifications(seen)
+                self._sync_delegate._save_seen(seen)
+                return data
+            await asyncio.to_thread(_side)
+        return data
+
+    async def _fetch_full_challenges(
+        self,
+        stubs: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Параллельный fetch detail для каждого stub'а через asyncio.gather."""
+        if not stubs:
+            return stubs
+        import asyncio
+
+        async def _one(stub: Dict[str, Any]) -> Dict[str, Any]:
+            cid = stub.get("id")
+            if cid is None:
+                return stub
+            try:
+                full = await self.get_challenge(int(cid))
+                merged = dict(stub)
+                merged.update(full)
+                return merged
+            except Exception as e:
+                print(
+                    f"[ctfd-async] _fetch_full_challenges: {cid}: {e}",
+                    file=sys.stderr,
+                )
+                return stub
+
+        return list(await asyncio.gather(*(_one(s) for s in stubs)))
+
+    async def get_challenge(self, challenge_id: int) -> Dict[str, Any]:
+        return await self._request("GET", f"/challenges/{challenge_id}")
+
+    async def get_challenge_solves(self, challenge_id: int) -> List[Dict[str, Any]]:
+        return await self._request("GET", f"/challenges/{challenge_id}/solves")
+
+    async def attempt(
+        self,
+        challenge_id: int,
+        submission: str,
+        *,
+        verify_score: bool = True,
+    ) -> SubmitResult:
+        data = await self._request(
+            "POST", "/challenges/attempt",
+            json_body={"challenge_id": challenge_id, "submission": submission},
+        )
+        if isinstance(data, dict) and "status" in data:
+            import asyncio
+            await asyncio.to_thread(
+                self._sync_delegate._autolog_attempt,
+                challenge_id, submission, data,
+            )
+            result = SubmitResult(data)
+            if result.correct and verify_score:
+                scored = await asyncio.to_thread(
+                    self._sync_delegate._verify_scored, challenge_id
+                )
+                await asyncio.to_thread(
+                    self._sync_delegate._note_score,
+                    challenge_id, result, scored,
+                )
+            return result
+        return SubmitResult(status="unknown", data=data)
+
+    async def get_hint(self, hint_id: int, preview: bool = False) -> Dict[str, Any]:
+        params = {"preview": "true"} if preview else None
+        return await self._request("GET", f"/hints/{hint_id}", params=params)
+
+    async def unlock(self, target_type: str, target_id: int) -> Any:
+        if target_type not in ("hints", "solutions"):
+            raise ValueError("target_type должен быть 'hints' или 'solutions'")
+        return await self._request(
+            "POST", "/unlocks",
+            json_body={"type": target_type, "target": target_id},
+        )
+
+    async def unlock_hint(self, hint_id: int) -> Any:
+        return await self.unlock("hints", hint_id)
+
+    async def unlock_solution(self, solution_id: int) -> Any:
+        return await self.unlock("solutions", solution_id)
+
+    async def unlock_free_hints(
+        self, challenge_or_hints: Any
+    ) -> List[int]:
+        """Async-версия. Платные (cost>0) НЕ трогаются."""
+        if isinstance(challenge_or_hints, dict):
+            hint_stubs = challenge_or_hints.get("hints") or []
+        else:
+            hint_stubs = list(challenge_or_hints or [])
+        import asyncio
+
+        async def _one(stub: Dict[str, Any]) -> Optional[int]:
+            hid = stub.get("id") if isinstance(stub, dict) else None
+            if hid is None:
+                return None
+            cost = stub.get("cost") if isinstance(stub, dict) else None
+            if cost is None:
+                detail = await self._request(
+                    "GET", f"/hints/{hid}", params={"preview": "true"}
+                )
+                cost = detail.get("cost", 0) if isinstance(detail, dict) else 0
+            if cost is not None and int(cost) <= 0:
+                try:
+                    await self.unlock_hint(int(hid))
+                    return int(hid)
+                except CTfdError as e:
+                    if "already" in str(e).lower():
+                        return int(hid)
+                    print(f"[ctfd-async] hint {hid}: {e}", file=sys.stderr)
+            return None
+
+        results = await asyncio.gather(*(_one(s) for s in hint_stubs))
+        return [r for r in results if r is not None]
+
+    async def scoreboard(self) -> List[Dict[str, Any]]:
+        return await self._request("GET", "/scoreboard")
+
+    async def scoreboard_top(
+        self, count: int = 10, bracket_id: Optional[int] = None,
+    ) -> Any:
+        count = max(1, min(50, int(count)))
+        params = {"bracket_id": bracket_id} if bracket_id is not None else None
+        return await self._request("GET", f"/scoreboard/top/{count}", params=params)
+
+    async def me(self) -> Dict[str, Any]:
+        return await self._request("GET", "/users/me")
+
+    async def my_solves(self) -> List[Dict[str, Any]]:
+        return await self._request("GET", "/users/me/solves")
+
+    async def my_fails(self) -> Any:
+        return await self._request("GET", "/users/me/fails")
+
+    async def my_awards(self) -> List[Dict[str, Any]]:
+        return await self._request("GET", "/users/me/awards")
+
+    async def my_team(self) -> Dict[str, Any]:
+        return await self._request("GET", "/teams/me", allow_404_none=True)
+
+    async def my_team_solves(self) -> List[Dict[str, Any]]:
+        return await self._request("GET", "/teams/me/solves")
+
+    async def notifications(self, since_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        params = {"since_id": since_id} if since_id is not None else None
+        return await self._request("GET", "/notifications", params=params)
+
+    async def download_file(
+        self, url: str, dest_dir: Optional[str] = None
+    ) -> Path:
+        """Async-скачка. Streaming через httpx.AsyncClient.stream. Локальный
+        file-I/O выполняется синхронно (он быстрый, не блокирует event-loop
+        надолго; для массовости пользователь может запустить несколько параллельно).
+
+        Bridge-режим: делегирует в sync-клиент (CDP-мост, base64-транспорт).
+        """
+        import asyncio
+        if (
+            self._sync_delegate._bridge is not None
+            or self._sync_delegate._bridge_mode == "cdp"
+        ):
+            return await asyncio.to_thread(
+                self._sync_delegate.download_file, url, dest_dir
+            )
+        if dest_dir is None:
+            if self._sync_delegate._active_ws:
+                dest_dir = str(self._sync_delegate._active_ws / "attachments")
+            else:
+                print(
+                    "[ctfd-async] WARNING: download_file без активного воркспейса — "
+                    "файл сохранён в /tmp.",
+                    file=sys.stderr,
+                )
+                dest_dir = "/tmp"
+        if url.startswith("/"):
+            url = f"{self.host}{url}"
+        elif not url.startswith(("http://", "https://")):
+            url = f"{self.host}/{url}"
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        name = (
+            url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1] or "download.bin"
+        )
+        out = dest / name
+
+        client = self._ensure_client()
+        async with await client.stream("GET", url) as r:
+            r.raise_for_status()
+            content = await r.aread()
+        await asyncio.to_thread(out.write_bytes, content)
+        return out
+
+    # ------------------------------------------------------------------
+    #  Workspace-методы — делегируем в sync-delegate через asyncio.to_thread
+    # ------------------------------------------------------------------
+    async def init_challenge_workspace(
+        self,
+        challenge: Dict[str, Any],
+        base: str = "~/Downloads/ctf",
+        *,
+        auto_unlock_free_hints: bool = False,
+    ) -> Path:
+        import asyncio
+        ws = await asyncio.to_thread(
+            self._sync_delegate.init_challenge_workspace,
+            challenge, base, auto_unlock_free_hints=auto_unlock_free_hints,
+        )
+        return ws
+
+    async def log_attempt(
+        self,
+        challenge_id: int,
+        entry: str,
+        status: Optional[str] = None,
+    ) -> Path:
+        import asyncio
+        return await asyncio.to_thread(
+            self._sync_delegate.log_attempt, challenge_id, entry, status
+        )
+
+    @property
+    def active_workspace(self) -> Optional[Path]:
+        return self._sync_delegate._active_ws
+
+
+# ====================================================================
 #  CLI
 # ====================================================================
 def _client_from_args(args: argparse.Namespace, allow_no_token: bool = False) -> CTfdClient:
@@ -1138,14 +2685,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Скаффолдить воркспейс задачи и скачать все её файлы в attachments/",
     )
     dc.add_argument("id", type=int)
+
+    ev = sub.add_parser(
+        "events",
+        help="Список событий в базе воркспейсов (детектор расползания деревьев)",
+    )
+    ev.add_argument("--base", default="~/Downloads/ctf", help="база воркспейсов")
+
+    # Глобальные --host/--token работают И ДО, И ПОСЛЕ сабкоманды: дублируем
+    # их в каждый subparser с default=SUPPRESS — значение, заданное после
+    # сабкоманды, попадает в namespace, не перетирая заданное до неё.
+    for _sp in sub.choices.values():
+        _sp.add_argument(
+            "--host", default=argparse.SUPPRESS,
+            help="то же, что глобальный --host (можно указать после подкоманды)",
+        )
+        _sp.add_argument(
+            "--token", default=argparse.SUPPRESS,
+            help="то же, что глобальный --token (можно указать после подкоманды)",
+        )
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
     cmd = args.cmd
-    # status работает оффлайн (без токена) — только локальная сводка, без сверки.
-    c = _client_from_args(args, allow_no_token=(cmd == "status"))
+    # status/events работают оффлайн (без токена) — только локальная сводка.
+    c = _client_from_args(args, allow_no_token=(cmd in ("status", "events")))
 
     if cmd == "challenges":
         flt = {"category": args.category} if args.category else None
@@ -1181,6 +2747,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         _print({"revoked": args.id})
     elif cmd == "status":
         _print(c.workspace_status(event=args.event, base=args.base))
+    elif cmd == "events":
+        _print(c.list_events(base=args.base))
     elif cmd == "sync":
         _print(c.sync_from_server(
             event=args.event, dry_run=args.dry_run, all_challenges=args.all
