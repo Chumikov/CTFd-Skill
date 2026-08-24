@@ -16,8 +16,11 @@ session-cookie через логин/пароль.
     python ctfd_client.py challenges --host https://ctf.example.com --token ctfd_...
     python ctfd_client.py --host https://ctf.example.com --token ctfd_... challenges
     python ctfd_client.py submit 42 "flag{...}" --host ... --token ...
+    python ctfd_client.py -p brunner challenges     # профиль из profiles.json
 
-Глобальные ``--host``/``--token`` принимаются как до, так и после подкоманды.
+Глобальные ``--host``/``--token``/``--profile`` принимаются как до, так и после
+подкоманды. Профили живут в ``~/.config/ctfd/profiles.json`` (ключ ``last`` —
+последний использованный; дефолт, когда ``-p`` не задан).
 
 Если хост за Cloudflare (прямой HTTP получает challenge-страницу) — включите
 browser bridge через CDP: запустите Chromium с ``--remote-debugging-port=9222``,
@@ -30,8 +33,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -59,6 +64,7 @@ __all__ = [
 
 CTFD_HOST_ENV = "CTFD_HOST"
 CTFD_TOKEN_ENV = "CTFD_TOKEN"
+CTFD_PROFILE_ENV = "CTFD_PROFILE"
 API_PREFIX = "/api/v1"
 
 _SEC_RE = re.compile(r"(\d+)\s+seconds?", re.IGNORECASE)
@@ -305,6 +311,113 @@ _NOTIFY_KEYWORDS = [
 # Файлы метаданных воркспейса. Приоритет чтения — слева направо; при записи
 # challenge.json старый challenge.yaml удаляется (миграция).
 _META_FILES = ("challenge.json", "challenge.yaml")
+
+# Человекочитаемые пояснения к HTTP-кодам: сырой код → что делать.
+_HTTP_HINTS = {
+    400: "некорректный запрос (валидация поля) — см. errors в теле ответа",
+    401: "не авторизован: токен/сессия протухли — сгенерируйте новый API-токен "
+         "(Settings → Access Tokens) и обновите --token/$CTFD_TOKEN/профиль",
+    403: "доступ запрещён: задача скрыта/закрыта, требование не выполнено "
+         "или эндпоинт admin-only",
+    404: "ресурс не существует: неверный id или задача ещё не опубликована",
+    429: "rate limit — подождите перед повтором",
+    500: "серверная ошибка CTFd — обычно временная, повторите позже",
+    502: "bad gateway — CTFd или реверс-прокси недоступен, повторите позже",
+    503: "сервис недоступен (maintenance?) — повторите позже",
+    504: "gateway timeout — повторите позже",
+}
+
+# Автоповтор (backoff + jitter) — ТОЛЬКО для идемпотентных методов: повтор
+# POST /attempt при неявном сбое может задвоить попытку, POST /unlocks —
+# списать баллы дважды. Никогда не ретраим записи.
+_IDEMPOTENT_METHODS = {"GET", "HEAD"}
+_HTTP_RETRIES = 2  # повтора сверх первого запроса
+_RETRY_BASE_DELAY = 0.5  # сек; delay = base * 2**attempt + jitter
+
+
+def _explain_http_error(
+    status: int, method: str, path: str, body: Any = ""
+) -> CTfdError:
+    """Собрать CTfdError с человеческим пояснением вместо сырого HTTP-кода."""
+    hint = _HTTP_HINTS.get(int(status), "неизвестная ошибка")
+    return CTfdError(f"HTTP {status} {method} {path}: {hint} | {body}")
+
+
+# ----------------------------------------------------------------------
+#  Профили событий: ~/.config/ctfd/profiles.json
+# ----------------------------------------------------------------------
+# Формат (файл содержит токены — при записи выставляется chmod 0600):
+#   {
+#     "last": "brunner",
+#     "profiles": {"brunner": {"host": "https://...", "token": "ctfd_..."}}
+#   }
+
+def _profiles_path() -> Path:
+    return Path(os.path.expanduser("~/.config/ctfd/profiles.json"))
+
+
+def _load_profiles() -> Dict[str, Any]:
+    p = _profiles_path()
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_profiles(data: Dict[str, Any]) -> None:
+    p = _profiles_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    try:
+        p.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _mask_token(token: str) -> str:
+    if not token:
+        return ""
+    if len(token) <= 8:
+        return "*" * len(token)
+    return f"{token[:4]}...{token[-4:]}"
+
+
+def _resolve_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Найти профиль по имени; без имени — профиль ``last`` (если задан).
+
+    Возвращает ``{"name": ..., "host": ..., "token": ...}`` или ``None``.
+    Явно заданное имя, которого нет в файле, — ошибка (не молчим).
+    """
+    data = _load_profiles()
+    profiles = data.get("profiles") or {}
+    if name:
+        prof = profiles.get(name)
+        if not isinstance(prof, dict) or not prof.get("host"):
+            raise CTfdError(
+                f"Профиль {name!r} не найден в {_profiles_path()}. "
+                f"Доступные: {', '.join(sorted(profiles)) or '—'}."
+            )
+        return {"name": name, **prof}
+    last = data.get("last")
+    if isinstance(last, str) and isinstance(profiles.get(last), dict):
+        prof = profiles[last]
+        if prof.get("host"):
+            return {"name": last, **prof}
+    return None
+
+
+def _touch_last_profile(name: str) -> None:
+    """Запомнить последний использованный профиль (дефолт для будущих вызовов)."""
+    data = _load_profiles()
+    if data.get("last") == name:
+        return
+    data["last"] = name
+    _save_profiles(data)
 
 
 class CTfdError(Exception):
@@ -835,6 +948,53 @@ class CTfdClient:
         sc = getattr(r, "status_code", "?")
         return f"HTTP {sc}: {_CF_HINT}"
 
+    def _fetch_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Any] = None,
+        data: Optional[Any] = None,
+    ) -> Any:
+        """Один запрос + автоповтор для идемпотентных методов (GET/HEAD).
+
+        Повторяем на сетевых сбоях и 5xx с exponential backoff + jitter
+        (≤ ``_HTTP_RETRIES`` повторов). Записи (POST/PUT/...) никогда не
+        ретраятся — повтор мог бы задвоить попытку сабмита или списать
+        баллы за хинт дважды.
+        """
+        method_u = method.upper()
+        idempotent = method_u in _IDEMPOTENT_METHODS
+        for attempt in range(_HTTP_RETRIES + 1):
+            try:
+                r = self._raw_request(
+                    method, url, params=params, json_body=json_body, data=data
+                )
+            except CTfdError as e:
+                if not idempotent or attempt >= _HTTP_RETRIES:
+                    raise
+                reason = f"network: {e}"
+            else:
+                if (
+                    not idempotent
+                    or attempt >= _HTTP_RETRIES
+                    or not (500 <= r.status_code <= 599)
+                    # CF-челлендж (в т.ч. 503) не ретраим — его перехватит
+                    # Cloudflare-детект в _request и переключит на bridge.
+                    or _looks_like_cloudflare(r)
+                ):
+                    return r
+                reason = f"HTTP {r.status_code}"
+            delay = _RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+            print(
+                f"[ctfd] {method_u} {reason} — retry "
+                f"{attempt + 1}/{_HTTP_RETRIES} in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+        raise CTfdError("unreachable")  # pragma: no cover
+
     def _request(
         self,
         method: str,
@@ -847,7 +1007,7 @@ class CTfdClient:
         allow_404_none: bool = False,
     ) -> Any:
         url = self._url(path)
-        r = self._raw_request(
+        r = self._fetch_with_retry(
             method, url, params=params, json_body=json_body, data=data
         )
 
@@ -912,10 +1072,10 @@ class CTfdClient:
                     allow_404_none=allow_404_none,
                 )
         if r.status_code == 401:
-            raise CTfdError(f"Не авторизован (HTTP 401): {self._safe_text(r)}")
+            raise _explain_http_error(401, method, path, self._safe_text(r))
         if not r.ok:
-            raise CTfdError(
-                f"HTTP {r.status_code} {method} {path}: {self._safe_text(r)}"
+            raise _explain_http_error(
+                r.status_code, method, path, self._safe_text(r)
             )
 
         if r.status_code == 204 or not r.content:
@@ -1225,17 +1385,24 @@ class CTfdClient:
         скоринга — при расхождении печатается warning и пишется в NOTES.md.
 
         Побочные эффекты (best-effort, НИКОГДА не рвут сабмит):
+        - дубликат-ворнинг: если этот флаг уже отправлялся в задачу и был
+          неверен — предупреждение в stderr ДО отправки (экономит попытки
+          при ``max_attempts``; журнал ``<event>/attempts.json``);
         - автоматически дописывает запись в ``NOTES.md`` активной задачи;
         - при ``correct``/``already_solved`` выставляет ``solved: true`` в
           локальном ``challenge.json`` (back-mapping «папка ↔ id ↔ solved»).
         Если воркспейс для задачи не инициализирован — авто-лог тихо пропускается.
         """
+        self._warn_duplicate_attempt(challenge_id, submission)
         data = self._request(
             "POST",
             "/challenges/attempt",
             json_body={"challenge_id": challenge_id, "submission": submission},
         )
         if isinstance(data, dict) and "status" in data:
+            self._journal_attempt(
+                challenge_id, submission, str(data.get("status", "unknown"))
+            )
             self._autolog_attempt(challenge_id, submission, data)
             result = SubmitResult(data)
             if result.correct and verify_score:
@@ -1358,6 +1525,59 @@ class CTfdClient:
                 )
         return unlocked
 
+    def unlock_hint_confirmed(
+        self, hint_id: int, *, assume_yes: bool = False
+    ) -> Dict[str, Any]:
+        """Разблокировать хинт с показом цены и подтверждением (без input()).
+
+        Без ``assume_yes`` НИЧЕГО не списывает: возвращает превью хинта,
+        стоимость и текущий счёт + подсказку «повторите с --yes».
+        С ``assume_yes`` — разблокирует и сразу возвращает ``content``
+        (отдельный повторный GET не нужен). Уже разблокированный хинт
+        возвращается как есть, без списания.
+        """
+        hint = self._request(
+            "GET", f"/hints/{hint_id}", params={"preview": "true"}
+        )
+        hint = hint if isinstance(hint, dict) else {}
+        out: Dict[str, Any] = {
+            "hint_id": int(hint_id),
+            "cost": hint.get("cost"),
+        }
+        if hint.get("content"):
+            # Уже разблокирован — контент виден прямо в превью.
+            out.update(
+                {
+                    "unlocked": True,
+                    "content": hint.get("content"),
+                    "note": "хинт уже разблокирован — баллы не списаны",
+                }
+            )
+            return out
+        try:
+            out["score"] = (self.me() or {}).get("score")
+        except Exception:
+            out["score"] = None
+        if not assume_yes:
+            out["unlocked"] = False
+            out["note"] = (
+                f"цена {hint.get('cost')} балл., текущий счёт {out['score']}. "
+                "Повторите с --yes (assume_yes=True), чтобы списать баллы "
+                "и открыть текст хинта."
+            )
+            return out
+        self.unlock("hints", int(hint_id))
+        full = self._request("GET", f"/hints/{hint_id}")
+        full = full if isinstance(full, dict) else {}
+        out.update(
+            {
+                "unlocked": True,
+                "content": full.get("content"),
+                "note": f"списано {hint.get('cost')} балл.",
+            }
+        )
+        return out
+
     def scoreboard(self) -> List[Dict[str, Any]]:
         return self._request("GET", "/scoreboard")
 
@@ -1367,6 +1587,188 @@ class CTfdClient:
         count = max(1, min(50, int(count)))
         params = {"bracket_id": bracket_id} if bracket_id is not None else None
         return self._request("GET", f"/scoreboard/top/{count}", params=params)
+
+    def scoreboard_diff(
+        self, *, around: int = 5, top: int = 10
+    ) -> Dict[str, Any]:
+        """Текущий скорборд против прошлого снапшота — только изменения.
+
+        Альтернатива watch-циклу (который жёст блокирует вызов и жжёт
+        контекст полными дампами): каждый вызов читает прошлый снапшот из
+        ``.seen.json`` (``scoreboard_snapshot``), возвращает дельты — своя
+        позиция ±, кто кого обогнал, топ с изменениями — и записывает новый
+        снапшот. Первый вызов просто сохраняет baseline.
+        """
+        data = self.scoreboard()
+        standings = (
+            data if isinstance(data, list) else (data or {}).get("standings") or []
+        )
+        old = self._load_seen().get("scoreboard_snapshot") or {}
+        my_aid = self._my_standings_account_id()
+        out = self._compute_scoreboard_diff(
+            old.get("standings") or [],
+            standings,
+            around=around,
+            top=top,
+            my_account_id=my_aid,
+            prev_ts=old.get("ts"),
+        )
+        seen = self._load_seen()
+        seen["scoreboard_snapshot"] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "standings": [
+                {
+                    "pos": r.get("pos"),
+                    "account_id": r.get("account_id"),
+                    "name": r.get("name") or r.get("team"),
+                    "score": r.get("score"),
+                }
+                for r in standings
+                if isinstance(r, dict)
+            ],
+        }
+        self._save_seen(seen)
+        return out
+
+    def _my_standings_account_id(self) -> Optional[int]:
+        """Свой account_id в standings: team_id (teams-режим) или user id."""
+        try:
+            me = self.me() or {}
+        except Exception:
+            return None
+        for key in ("team_id", "id"):
+            val = me.get(key)
+            if val is not None:
+                return int(val)
+        return None
+
+    @staticmethod
+    def _compute_scoreboard_diff(
+        old_rows: List[Dict[str, Any]],
+        new_rows: List[Dict[str, Any]],
+        *,
+        around: int = 5,
+        top: int = 10,
+        my_account_id: Optional[int] = None,
+        prev_ts: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Чистая функция диффа двух standings (для тестов и CLI).
+
+        ``delta > 0`` — поднялся; ``passed_me`` — кто обогнал меня;
+        ``i_passed`` — кого обогнал я.
+        """
+        def _index(rows: List[Dict[str, Any]]) -> Dict[Any, Dict[str, Any]]:
+            idx: Dict[Any, Dict[str, Any]] = {}
+            for r in rows:
+                aid = r.get("account_id")
+                if aid is None:
+                    continue
+                idx[aid] = {
+                    "name": r.get("name") or r.get("team") or "?",
+                    "pos": r.get("pos"),
+                    "score": r.get("score", 0),
+                }
+            return idx
+
+        old_idx = _index(old_rows)
+        new_idx = _index(new_rows)
+        out: Dict[str, Any] = {"prev_ts": prev_ts}
+
+        if not old_idx:
+            out["note"] = (
+                "первый снапшот — сохранён; дифф появится со следующего вызова"
+            )
+
+        # Все сдвинувшиеся позиции (максимум 20, крупнейшие взлёты первыми).
+        changed = []
+        for aid, nw in new_idx.items():
+            od = old_idx.get(aid)
+            if od and od.get("pos") and nw.get("pos"):
+                delta = od["pos"] - nw["pos"]
+                if delta != 0:
+                    changed.append(
+                        {
+                            "name": nw["name"],
+                            "pos": nw["pos"],
+                            "delta": delta,
+                            "score": nw["score"],
+                        }
+                    )
+        changed.sort(key=lambda x: (-x["delta"], x["pos"] or 0))
+        out["changed"] = changed[:20]
+
+        # Топ с дельтами.
+        top_rows = []
+        by_pos = sorted(
+            ((aid, nw) for aid, nw in new_idx.items() if nw.get("pos")),
+            key=lambda pair: pair[1]["pos"],
+        )
+        for aid, nw in by_pos[: max(1, int(top))]:
+            od = old_idx.get(aid)
+            top_rows.append(
+                {
+                    "name": nw["name"],
+                    "pos": nw["pos"],
+                    "delta": (
+                        od["pos"] - nw["pos"]
+                        if od and od.get("pos")
+                        else None
+                    ),
+                    "score": nw["score"],
+                }
+            )
+        out["top"] = top_rows
+
+        # Моя позиция ± окно, кто кого обогнал.
+        if my_account_id is not None and my_account_id in new_idx:
+            nw = new_idx[my_account_id]
+            od = old_idx.get(my_account_id)
+            out["my"] = {
+                "name": nw["name"],
+                "pos": nw["pos"],
+                "score": nw["score"],
+                "prev_pos": od.get("pos") if od else None,
+                "delta": (
+                    od["pos"] - nw["pos"]
+                    if od and od.get("pos") and nw.get("pos")
+                    else None
+                ),
+            }
+            if nw.get("pos"):
+                out["around_me"] = [
+                    {
+                        "name": w["name"],
+                        "pos": w["pos"],
+                        "delta": (
+                            old_idx[aid]["pos"] - w["pos"]
+                            if aid in old_idx and old_idx[aid].get("pos")
+                            else None
+                        ),
+                        "score": w["score"],
+                    }
+                    for aid, w in new_idx.items()
+                    if w.get("pos") and abs(w["pos"] - nw["pos"]) <= around
+                ]
+                out["around_me"].sort(key=lambda w: w["pos"])
+            my_old = od.get("pos") if od else None
+            if my_old and nw.get("pos"):
+                out["passed_me"] = [
+                    {"name": w["name"], "old_pos": old_idx[aid]["pos"],
+                     "pos": w["pos"]}
+                    for aid, w in new_idx.items()
+                    if aid != my_account_id and aid in old_idx
+                    and old_idx[aid].get("pos")
+                    and old_idx[aid]["pos"] > my_old and w["pos"] < nw["pos"]
+                ]
+                out["i_passed"] = [
+                    {"name": w["name"], "old_pos": old_idx[aid]["pos"],
+                     "pos": w["pos"]}
+                    for aid, w in new_idx.items()
+                    if aid != my_account_id and aid in old_idx
+                    and old_idx[aid].get("pos")
+                    and old_idx[aid]["pos"] < my_old and w["pos"] > nw["pos"]
+                ]
+        return out
 
     def me(self) -> Dict[str, Any]:
         """Текущий пользователь + своё место/баллы."""
@@ -1443,6 +1845,13 @@ class CTfdClient:
                 f"HTTP {r.status_code} GET {url}: {self._safe_text(r)}"
             )
         out.write_bytes(r.content)
+        # Контрольная сумма: детект обрыва/битой скачки (актуально для
+        # base64-транспорта через CDP-мост) до того, как распаковывать.
+        print(
+            f"[ctfd] saved {name} ({len(r.content)} B, "
+            f"sha256={hashlib.sha256(r.content).hexdigest()})",
+            file=sys.stderr,
+        )
         return out
 
     # -- персистентный CTF-воркспейс -------------------------------
@@ -1708,6 +2117,74 @@ class CTfdClient:
         except OSError:
             pass
 
+    # ------------------------------------------------------------------
+    #  Журнал попыток: <event>/attempts.json (дубликат-ворнинг)
+    # ------------------------------------------------------------------
+    def _attempts_path(self) -> Path:
+        return self._event_dir() / "attempts.json"
+
+    def _load_attempts(self) -> List[Dict[str, Any]]:
+        p = self._attempts_path()
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _journal_attempt(
+        self, challenge_id: int, submission: str, status: str
+    ) -> None:
+        """Best-effort запись попытки в ``attempts.json``. Никогда не бросает.
+
+        В отличие от NOTES.md (человекочитаемый журнал, флаг обрезается до
+        80 симв.) — структурированный и полный: основа для дубликат-ворнинга
+        перед тратой попытки.
+        """
+        try:
+            attempts = self._load_attempts()
+            attempts.append(
+                {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "chal_id": int(challenge_id),
+                    "flag": submission,
+                    "status": status,
+                }
+            )
+            self._attempts_path().write_text(
+                json.dumps(attempts, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print(f"[ctfd] attempts journal write failed: {e}", file=sys.stderr)
+
+    def _warn_duplicate_attempt(self, challenge_id: int, submission: str) -> bool:
+        """Предупредить, если этот флаг уже отправлялся в задачу и не зачёлся.
+
+        Проверка ДО сабмита — экономит попытки при ``max_attempts``.
+        Возвращает True, если предупреждение напечатано.
+        """
+        norm = submission.strip()
+        prev: Optional[Dict[str, Any]] = None
+        for a in self._load_attempts():
+            if (
+                a.get("chal_id") == int(challenge_id)
+                and str(a.get("flag", "")).strip() == norm
+            ):
+                prev = a  # последняя попытка с этим флагом
+        if not prev:
+            return False
+        if prev.get("status") in ("incorrect", "partial", "ratelimited"):
+            print(
+                f"[ctfd] WARNING: этот флаг уже отправлялся в #{challenge_id} "
+                f"({prev.get('ts', '?')}) и был неверен ({prev.get('status')}). "
+                f"Проверьте флаг перед тратой ещё одной попытки.",
+                file=sys.stderr,
+            )
+            return True
+        return False
+
     def _diff_new_challenges(
         self,
         chals: List[Dict[str, Any]],
@@ -1725,6 +2202,21 @@ class CTfdClient:
         ids_now = {int(c["id"]) for c in chals if c.get("id") is not None}
         known = set(seen.get("ids") or [])
         seen["ids"] = sorted(ids_now | known)
+        # Stubs для оффлайн-режима (challenges --offline): id → краткая карточка.
+        # Данные per-challenge полны даже в фильтрованном вызове — обновляем
+        # всё виденное (solves/solved_by_me меняются со временем).
+        stubs = seen.setdefault("stubs", {})
+        for c in chals:
+            cid = c.get("id")
+            if cid is None:
+                continue
+            stubs[str(cid)] = {
+                "name": c.get("name"),
+                "category": c.get("category"),
+                "value": c.get("value"),
+                "solves": c.get("solves"),
+                "solved_by_me": bool(c.get("solved_by_me", False)),
+            }
         if not seen.get("baselined"):
             if not filtered:
                 seen["baselined"] = True
@@ -2251,11 +2743,35 @@ class AsyncCTfdClient:
         headers: Dict[str, str] = {}
         if method.upper() in _WRITE_METHODS:
             headers.update(self._headers_for_write())
-        try:
-            r = await client.request(method, url, params=params, json=json_body,
-                                     data=data, headers=headers or None)
-        except httpx.HTTPError as e:
-            raise CTfdError(f"Ошибка запроса: {e}") from e
+        method_u = method.upper()
+        idempotent = method_u in _IDEMPOTENT_METHODS
+        r = None
+        for attempt in range(_HTTP_RETRIES + 1):
+            try:
+                r = await client.request(
+                    method, url, params=params, json=json_body,
+                    data=data, headers=headers or None,
+                )
+            except httpx.HTTPError as e:
+                if not idempotent or attempt >= _HTTP_RETRIES:
+                    raise CTfdError(f"Ошибка запроса: {e}") from e
+                reason = f"network: {e}"
+            else:
+                if (
+                    not idempotent
+                    or attempt >= _HTTP_RETRIES
+                    or not (500 <= r.status_code <= 599)
+                    or self._sync_delegate._is_cloudflare(r)
+                ):
+                    break
+                reason = f"HTTP {r.status_code}"
+            delay = _RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+            print(
+                f"[ctfd-async] {method_u} {reason} — retry "
+                f"{attempt + 1}/{_HTTP_RETRIES} in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(delay)
 
         # Cloudflare: пробуем переключиться на CDP-мост через sync-делегата
         # и повторить запрос уже через него; не вышло — внятная ошибка.
@@ -2303,10 +2819,13 @@ class AsyncCTfdClient:
                     retry=False, allow_404_none=allow_404_none,
                 )
         if r.status_code == 401:
-            raise CTfdError(f"Не авторизован (HTTP 401): {self._sync_delegate._safe_text_httpx(r)}")
+            raise _explain_http_error(
+                401, method, path, self._sync_delegate._safe_text_httpx(r)
+            )
         if not r.is_success:
-            raise CTfdError(
-                f"HTTP {r.status_code} {method} {path}: {self._sync_delegate._safe_text_httpx(r)}"
+            raise _explain_http_error(
+                r.status_code, method, path,
+                self._sync_delegate._safe_text_httpx(r),
             )
         if r.status_code == 204 or not r.content:
             return None
@@ -2409,12 +2928,19 @@ class AsyncCTfdClient:
         *,
         verify_score: bool = True,
     ) -> SubmitResult:
+        import asyncio
+        await asyncio.to_thread(
+            self._sync_delegate._warn_duplicate_attempt, challenge_id, submission
+        )
         data = await self._request(
             "POST", "/challenges/attempt",
             json_body={"challenge_id": challenge_id, "submission": submission},
         )
         if isinstance(data, dict) and "status" in data:
-            import asyncio
+            await asyncio.to_thread(
+                self._sync_delegate._journal_attempt,
+                challenge_id, submission, str(data.get("status", "unknown")),
+            )
             await asyncio.to_thread(
                 self._sync_delegate._autolog_attempt,
                 challenge_id, submission, data,
@@ -2557,6 +3083,11 @@ class AsyncCTfdClient:
             r.raise_for_status()
             content = await r.aread()
         await asyncio.to_thread(out.write_bytes, content)
+        print(
+            f"[ctfd-async] saved {out.name} ({len(content)} B, "
+            f"sha256={hashlib.sha256(content).hexdigest()})",
+            file=sys.stderr,
+        )
         return out
 
     # ------------------------------------------------------------------
@@ -2595,15 +3126,52 @@ class AsyncCTfdClient:
 # ====================================================================
 #  CLI
 # ====================================================================
-def _client_from_args(args: argparse.Namespace, allow_no_token: bool = False) -> CTfdClient:
-    host = args.host or os.environ.get(CTFD_HOST_ENV)
-    token = args.token or os.environ.get(CTFD_TOKEN_ENV)
+def _client_from_args(
+    args: argparse.Namespace,
+    allow_no_token: bool = False,
+    allow_no_host: bool = False,
+) -> CTfdClient:
+    host_arg = getattr(args, "host", None)
+    token_arg = getattr(args, "token", None)
+    profile_arg = getattr(args, "profile", None)
+    host = host_arg or os.environ.get(CTFD_HOST_ENV)
+    token = token_arg or os.environ.get(CTFD_TOKEN_ENV)
+    profile_name = profile_arg or os.environ.get(CTFD_PROFILE_ENV)
+    # Приоритет: явные --host/--token > явный -p PROFILE > env > профиль
+    # «last». Явный -p бьёт env — иначе переключение событий при заданном
+    # CTFD_HOST из прошлого CTF не работало бы вовсе.
+    prof: Optional[Dict[str, Any]] = None
+    if profile_name:
+        try:
+            prof = _resolve_profile(profile_name)
+        except CTfdError as e:
+            sys.exit(f"ошибка: {e}")
+        if prof:
+            if not host_arg:
+                host = prof.get("host") or host
+            if not token_arg:
+                token = prof.get("token") or token
+    elif not host or not token:
+        prof = _resolve_profile(None)
+        if prof:
+            host = host or prof.get("host")
+            token = token or prof.get("token")
+    if prof and prof.get("host") == host:
+        _touch_last_profile(prof["name"])
     if not host:
-        sys.exit(f"ошибка: требуется --host или ${CTFD_HOST_ENV}")
+        if allow_no_host:
+            # Полностью локальная команда (challenges --offline): событие
+            # берётся из $CTFD_EVENT, хост не нужен вовсе.
+            host = "http://offline.invalid"
+        else:
+            sys.exit(
+                f"ошибка: требуется --host, ${CTFD_HOST_ENV} или профиль "
+                f"(-p name, {_profiles_path()})"
+            )
     if not token and not allow_no_token:
         sys.exit(
-            f"ошибка: требуется --token или ${CTFD_TOKEN_ENV} "
-            "(логин по паролю в CLI не поддерживается)"
+            f"ошибка: требуется --token, ${CTFD_TOKEN_ENV} или профиль "
+            f"(-p name, {_profiles_path()})"
         )
     return CTfdClient(host, token=token or None)
 
@@ -2622,10 +3190,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--host", help=f"базовый URL CTFd (или env ${CTFD_HOST_ENV})")
     p.add_argument("--token", help=f"API-токен (или env ${CTFD_TOKEN_ENV})")
+    p.add_argument(
+        "-p", "--profile",
+        help=f"профиль из {_profiles_path()} (или env ${CTFD_PROFILE_ENV}; "
+             "дефолт — «last»)",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     lc = sub.add_parser("challenges", help="Список челленджей")
     lc.add_argument("--category")
+    lc.add_argument(
+        "--new", action="store_true",
+        help="только задачи, которых не было в .seen.json (новые дропы)",
+    )
+    lc.add_argument(
+        "--unsolved", action="store_true", help="только нерешённые мной",
+    )
+    lc.add_argument(
+        "--sort", choices=["value", "solves"],
+        help="сортировка: по убыванию (value — приоритизация баллов, "
+             "solves — популярные первыми)",
+    )
+    lc.add_argument("--asc", action="store_true", help="обратный порядок сортировки")
+    lc.add_argument(
+        "--offline", action="store_true",
+        help="без HTTP: карточки задач из снапшота .seen.json",
+    )
 
     g = sub.add_parser("challenge", help="Детали задачи")
     g.add_argument("id", type=int)
@@ -2636,14 +3226,32 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("me", help="Текущий пользователь")
     sub.add_parser("solves", help="Мои решения")
-    sub.add_parser("scoreboard", help="Рейтинг")
+    sb = sub.add_parser("scoreboard", help="Рейтинг")
+    sb.add_argument(
+        "--diff", action="store_true",
+        help="только изменения против прошлого снапшота (свой ход события)",
+    )
+    sb.add_argument(
+        "--around", type=int, default=5,
+        help="окно позиций вокруг себя для --diff (по умолчанию 5)",
+    )
+    pr = sub.add_parser(
+        "profiles", help="Профили событий (токен маскирован)",
+    )
     t = sub.add_parser("top", help="Топ-N рейтинга")
     t.add_argument("n", type=int, nargs="?", default=10)
 
     h = sub.add_parser("hint", help="Показать хинт")
     h.add_argument("id", type=int)
-    hu = sub.add_parser("unlock-hint", help="Разблокировать хинт (стоимость в баллах)")
+    hu = sub.add_parser(
+        "unlock-hint",
+        help="Разблокировать хинт: покажет цену; --yes — списать баллы",
+    )
     hu.add_argument("id", type=int)
+    hu.add_argument(
+        "--yes", action="store_true",
+        help="подтвердить списание баллов (без флага — только цена)",
+    )
     su = sub.add_parser("unlock-solution", help="Разблокировать официальное решение (стоимость в баллах)")
     su.add_argument("id", type=int)
 
@@ -2692,9 +3300,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument("--base", default="~/Downloads/ctf", help="база воркспейсов")
 
-    # Глобальные --host/--token работают И ДО, И ПОСЛЕ сабкоманды: дублируем
-    # их в каждый subparser с default=SUPPRESS — значение, заданное после
-    # сабкоманды, попадает в namespace, не перетирая заданное до неё.
+    # Глобальные --host/--token/--profile работают И ДО, И ПОСЛЕ сабкоманды:
+    # дублируем их в каждый subparser с default=SUPPRESS — значение, заданное
+    # после сабкоманды, попадает в namespace, не перетирая заданное до неё.
     for _sp in sub.choices.values():
         _sp.add_argument(
             "--host", default=argparse.SUPPRESS,
@@ -2704,18 +3312,64 @@ def _build_parser() -> argparse.ArgumentParser:
             "--token", default=argparse.SUPPRESS,
             help="то же, что глобальный --token (можно указать после подкоманды)",
         )
+        _sp.add_argument(
+            "-p", "--profile", default=argparse.SUPPRESS,
+            help="то же, что глобальный --profile (можно указать после подкоманды)",
+        )
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
     cmd = args.cmd
-    # status/events работают оффлайн (без токена) — только локальная сводка.
-    c = _client_from_args(args, allow_no_token=(cmd in ("status", "events")))
+
+    # profiles — полностью оффлайн: клиент (и host/token) не нужны вовсе.
+    if cmd == "profiles":
+        data = _load_profiles()
+        rows = []
+        for name, prof in sorted((data.get("profiles") or {}).items()):
+            rows.append(
+                {
+                    "profile": name,
+                    "host": prof.get("host"),
+                    "token": _mask_token(str(prof.get("token") or "")),
+                    "last": data.get("last") == name,
+                }
+            )
+        _print({"path": str(_profiles_path()), "profiles": rows})
+        return 0
+
+    # status/events — оффлайн (без токена); challenges --offline — вообще
+    # без сети (событие из $CTFD_EVENT, host/token не нужны).
+    offline_chals = cmd == "challenges" and getattr(args, "offline", False)
+    c = _client_from_args(
+        args,
+        allow_no_token=(cmd in ("status", "events") or offline_chals),
+        allow_no_host=offline_chals,
+    )
 
     if cmd == "challenges":
-        flt = {"category": args.category} if args.category else None
-        _print(c.list_challenges(**(flt or {})))
+        if args.offline:
+            stubs = c._load_seen().get("stubs") or {}
+            chals = [dict(info, id=int(k)) for k, info in stubs.items()]
+            chals.sort(key=lambda x: x["id"])
+        else:
+            known = None
+            if args.new:
+                known = set(c._load_seen().get("ids") or [])
+            flt = {"category": args.category} if args.category else None
+            chals = c.list_challenges(**(flt or {}))
+            if known is not None:
+                chals = [ch for ch in chals if ch.get("id") not in known]
+        if args.unsolved:
+            chals = [ch for ch in chals if not ch.get("solved_by_me")]
+        if args.sort:
+            reverse = not args.asc  # по умолчанию — по убыванию
+            chals.sort(
+                key=lambda x: (x.get(args.sort) or 0),
+                reverse=reverse,
+            )
+        _print(chals)
     elif cmd == "challenge":
         _print(c.get_challenge(args.id))
     elif cmd == "submit":
@@ -2725,13 +3379,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif cmd == "solves":
         _print(c.my_solves())
     elif cmd == "scoreboard":
-        _print(c.scoreboard())
+        if args.diff:
+            _print(c.scoreboard_diff(around=args.around))
+        else:
+            _print(c.scoreboard())
     elif cmd == "top":
         _print(c.scoreboard_top(args.n))
     elif cmd == "hint":
         _print(c.get_hint(args.id))
     elif cmd == "unlock-hint":
-        _print(c.unlock_hint(args.id))
+        _print(c.unlock_hint_confirmed(args.id, assume_yes=args.yes))
     elif cmd == "unlock-solution":
         _print(c.unlock_solution(args.id))
     elif cmd == "download":
@@ -2758,7 +3415,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         ws = c.init_challenge_workspace(detail)
         files = detail.get("files") or []
         paths = [str(c.download_file(f)) for f in files]
-        _print({"workspace": str(ws), "files": len(files), "downloaded": paths})
+        checksums = []
+        for p in paths:
+            blob = Path(p).read_bytes()
+            checksums.append(
+                {
+                    "file": Path(p).name,
+                    "size": len(blob),
+                    "sha256": hashlib.sha256(blob).hexdigest(),
+                }
+            )
+        _print(
+            {
+                "workspace": str(ws),
+                "files": len(files),
+                "downloaded": paths,
+                "checksums": checksums,
+            }
+        )
     return 0
 
 

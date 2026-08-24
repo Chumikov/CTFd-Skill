@@ -24,6 +24,26 @@ Ask the user (or read env) for:
 - `<HOST>` — base URL of the CTFd instance.
 - Auth: **API token** (recommended) OR username/password.
 
+**Profiles (preferred for recurring/multi events).** Store once in
+`~/.config/ctfd/profiles.json` (chmod 0600, auto-set on save):
+
+```json
+{
+  "last": "brunner",
+  "profiles": {
+    "brunner": {"host": "https://global.brunnerctf.dk", "token": "ctfd_..."}
+  }
+}
+```
+
+Then every CLI call shrinks to `python scripts/ctfd_client.py -p brunner <cmd>`
+(the `last`-used profile is the default when `-p` is omitted — the client
+updates it on each use). Precedence: explicit `--host/--token` > explicit
+`-p NAME` > `CTFD_HOST`/`CTFD_TOKEN` env > `last` profile. `profiles` lists
+what's stored (token masked). `-p` works before OR after the subcommand, and
+beats stale `CTFD_*` env from a previous event — switching events mid-session
+is just `-p other-event`.
+
 **API token is strongly preferred.** Get one via the UI
 (*Settings → Access Tokens → Generate*) or via the API itself (see §tokens).
 With a token you send two headers on every request and **CSRF is fully bypassed**:
@@ -140,6 +160,14 @@ This means the flag submission itself is always recorded. **Intermediate
 steps** (hypotheses, tool runs, wrong guesses before the final attempt) still
 require explicit `ctfd.log_attempt(...)` — only the agent knows those.
 
+**Duplicate-flag guard (saves attempts).** Every submit also lands in the
+structured journal `~/Downloads/ctf/<event>/attempts.json`
+(`{ts, chal_id, flag, status}` — full flag, unlike the truncated NOTES.md
+preview). Before each submission `attempt()` checks it and warns to stderr if
+this exact flag was already sent to this challenge and came back
+`incorrect`/`partial`/`ratelimited` — read the warning, don't burn a
+`max_attempts` slot on a known-bad flag (it's a warning, not a block).
+
 To reconcile local tracking with server truth (catches drift like
 "22 local vs 25 server"):
 
@@ -156,7 +184,10 @@ python scripts/ctfd_client.py download-challenge 42   # init ws + download all f
 `GET /api/v1/challenges/<id>` → `data.files[]` are **already-signed URLs**.
 Do NOT construct the signature yourself. Just GET each file URL with the same
 session/token → raw bytes. The client's `download_file(url, dest_dir)` does this
-and streams to disk (default `/tmp`).
+and streams to disk (default `/tmp`). Every download prints a stderr line
+`saved <name> (<size> B, sha256=<...>)` — verify sizes/checksums before
+unpacking (catches truncated transfers, especially over the base64 CDP
+bridge); `download-challenge <id>` returns a per-file `{size, sha256}` summary.
 
 ## 4a. Persistent workspace — NEVER lose CTF work to a reboot
 
@@ -214,6 +245,11 @@ Default location: `~/Downloads/ctf/<event>/<category>/<slug>/`.
    `poll_notifications=False`. **Do not** call it with a filter
    (`category=...`) before the first unfiltered call — the baseline stays
    incomplete and new-challenge detection is disabled.
+   The same listing also records per-challenge stubs
+   (name/category/value/solves/solved_by_me) into `.seen.json`, so
+   prioritization works offline: `challenges --offline --unsolved --sort
+   value` (no HTTP at all — no host/token needed, event from `CTFD_EVENT`),
+   and `challenges --new` prints only fresh drops.
 6. **Resuming a session** (fresh start / after context compaction) — re-read
    `ws/NOTES.md` of the active challenge; periodically reconcile with
    `python scripts/ctfd_client.py status` (catches solve drift vs server).
@@ -264,15 +300,37 @@ POST /api/v1/unlocks   {"type":"hints","target":<hint_id>}
 - Creates a negative `Award` (−cost) → your score drops by the hint cost.
 - After unlocking, re-`GET /api/v1/hints/<id>` to read `content`.
 
+**Confirm-before-spend flow (default in the client).**
+`ctfd.unlock_hint_confirmed(id)` / CLI `unlock-hint <id>` first fetches the
+preview (`GET /hints/<id>?preview=true`), then returns cost + current score
+WITHOUT spending anything — re-run with `--yes` (`assume_yes=True`) to
+actually unlock; the response then already includes the hint `content` (no
+manual re-GET). Already-unlocked hints return their content with no charge.
+Never script a blind `unlock()` for paid hints; the orchestrator (not a
+subagent) decides whether the points are worth it — see §7b. Note: CTFd
+exposes no preview for `solutions`, so `unlock-solution` stays a direct
+spend.
+
 `type:"solutions"` unlocks a challenge's official solution (if exposed).
 
-## 6. Rate limits / 429
+## 6. Rate limits / 429 / errors
 
 - `/challenges/attempt`: ~10 wrong submissions per 60s per (account, challenge).
   On 429 read `data.message` for the wait seconds; sleep, retry once.
 - `/login`: 10 POST / 5s per IP (generic limiter → `{"code":429,"message":...}`).
 - **No standard `X-RateLimit-*` headers.** Trust the JSON body.
 - The client handles the attempt 429 automatically.
+
+**Human-readable HTTP errors.** Raw codes are mapped to actions: `401` →
+token/session expired, generate a new API token; `403` → challenge
+hidden/closed or admin-only endpoint; `404` → bad id or not yet published;
+`5xx` → usually transient. Read the `|`-separated hint in the error text
+before retrying blindly.
+
+**Auto-retry (GET only).** Idempotent requests (GET/HEAD) are retried up to 2
+times on network errors and 5xx with exponential backoff + jitter. Writes
+(POST/PUT/DELETE — attempts, unlocks, token ops) are NEVER auto-retried: a
+hidden failure could double-submit a flag or double-charge a hint.
 
 ## 6a. Browser bridge (Cloudflare) — CDP transport
 
@@ -391,13 +449,26 @@ python scripts/ctfd_client.py sync --dry-run  # preview backfill
 python scripts/ctfd_client.py sync            # rebuild challenge.json from my_solves()
 ```
 
-Or via CLI straight from Bash (global `--host`/`--token` are accepted BOTH
-before and after the subcommand):
+Or via CLI straight from Bash (global `--host`/`--token`/`--profile` are
+accepted BOTH before and after the subcommand; `-p` reads
+`~/.config/ctfd/profiles.json`, default = last used — see §0):
 ```
-python scripts/ctfd_client.py challenges   --host "$CTFD_HOST" --token "$CTFD_TOKEN"
-python scripts/ctfd_client.py submit 42 "flag{...}" --host "$CTFD_HOST" --token "$CTFD_TOKEN"
-python scripts/ctfd_client.py me --host "$CTFD_HOST" --token "$CTFD_TOKEN"
+ python scripts/ctfd_client.py -p brunner challenges            # профиль вместо host/token
+ python scripts/ctfd_client.py -p brunner submit 42 "flag{...}"
+ python scripts/ctfd_client.py challenges --new                 # только новые дропы
+ python scripts/ctfd_client.py challenges --offline --unsolved --sort value   # приоритизация без HTTP
+ python scripts/ctfd_client.py scoreboard --diff                # своя позиция ±, кто кого обогнал
+ python scripts/ctfd_client.py unlock-hint 7                    # цена без списания
+ python scripts/ctfd_client.py unlock-hint 7 --yes              # списать + сразу текст хинта
 ```
+
+**Scoreboard diffs instead of watch loops.** `scoreboard --diff [--around N]`
+compares against the snapshot from the previous `--diff` call (stored in
+`.seen.json`): your position ±, `passed_me` / `i_passed`, changed positions,
+top with deltas. No blocking loop, no full dumps every 60s — call it when you
+want an update; the first call just stores the baseline. A `--watch 60`
+daemon would block the Bash tool until timeout and burn context on repeated
+dumps — that's why it doesn't exist.
 
 ## 7a. HexStrike MCP tools — PREFER for offensive security work
 
@@ -448,9 +519,12 @@ CLI call — and returns the verdict, not the bare flag.
 Put into EVERY subagent prompt:
 - challenge id + name, the canonical `CTFD_EVENT` slug, and the workspace
   path `<ws>` — the subagent works INSIDE it, it never creates one;
-- the exact submission command (global args work after the subcommand):
+- the exact submission command — with a profile (preferred; see §0) or
+  explicit globals (both work after the subcommand):
 
   ```bash
+  python <skill-path>/scripts/ctfd_client.py -p <event> submit <id> "<flag>"
+  # либо без профиля:
   python <skill-path>/scripts/ctfd_client.py submit <id> "<flag>" \
       --host "$CTFD_HOST" --token "$CTFD_TOKEN"
   ```
@@ -479,6 +553,30 @@ submits as soon as transport is back.
 After collecting results the orchestrator reconciles: `status` → `sync`
 (solved flips already landed in each `challenge.json` via §3a autolog),
 and `events` to confirm no parallel trees appeared.
+
+## 7c. Dynamic per-player instances (NON-standard — discover, don't assume)
+
+Some events run per-player challenge instances (a deploy button on the
+challenge page that spins up a container and shows `host:port`). **This is a
+per-host plugin/service, NOT part of the CTFd API** — there is no standard
+`instance up/down` endpoint, so the client deliberately has no such
+subcommand. Hand-rolled curl against guessed endpoints breaks on the next
+event. Instead, when a challenge clearly needs a personal instance:
+
+1. **Check the challenge detail first** — `get_challenge(id)` may already
+   carry `connection_info`, or the (markdown-converted) description contains
+   the instance URL/button/link (the client's connection-info regexes catch
+   `nc`/`ncat`/`ssh`/URLs).
+2. **Discover the real API from the page, not from memory.** Open the
+   challenge page in the browser (or via the CDP bridge §6a) and watch the
+   network tab / page JS for the XHRs the deploy button fires — typically
+   something like `POST /api/v1/plugins/...` or a separate `challs.<host>`
+   service returning `{status: pending|ready, host, port}`.
+3. **Then script exactly what you observed**: create → poll status until
+   `ready` (bounded timeout, 2–3 s interval) → use `host:port` → tear down
+   when finished (events often cap concurrent instances).
+4. Log the instance lifecycle in the challenge's `NOTES.md` (creation,
+   `host:port`, teardown) — orphaned instances can block new deploys.
 
 ## 8. What is NOT covered (admin only — out of scope for a player)
 
