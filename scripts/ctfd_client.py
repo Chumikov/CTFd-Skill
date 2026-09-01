@@ -16,7 +16,7 @@ session-cookie через логин/пароль.
     python ctfd_client.py challenges --host https://ctf.example.com --token ctfd_...
     python ctfd_client.py --host https://ctf.example.com --token ctfd_... challenges
     python ctfd_client.py submit 42 "flag{...}" --host ... --token ...
-    python ctfd_client.py -p brunner challenges     # профиль из profiles.json
+    python ctfd_client.py -p demo challenges        # профиль из profiles.json
 
 Глобальные ``--host``/``--token``/``--profile`` принимаются как до, так и после
 подкоманды. Профили живут в ``~/.config/ctfd/profiles.json`` (ключ ``last`` —
@@ -348,8 +348,8 @@ def _explain_http_error(
 # ----------------------------------------------------------------------
 # Формат (файл содержит токены — при записи выставляется chmod 0600):
 #   {
-#     "last": "brunner",
-#     "profiles": {"brunner": {"host": "https://...", "token": "ctfd_..."}}
+#     "last": "demo",
+#     "profiles": {"demo": {"host": "https://...", "token": "ctfd_..."}}
 #   }
 
 def _profiles_path() -> Path:
@@ -2557,7 +2557,7 @@ class CTfdClient:
     # -- управление собственными API-токенами --------------------------
     # ------------------------------------------------------------------
     #  Боевой воркфлоу CTF: контейнеры, dump, очередь сабмита, preflight,
-    #  snapshot (хэндофф). Добавлено по итогам CompFEST18 (см. POST-MORTEM).
+    #  snapshot (хэндофф). Боевой воркфлоу, вынесенный из пост-мортема.
     # ------------------------------------------------------------------
     def container_request(self, challenge_id: int) -> Dict[str, Any]:
         """Поднять/продлить инстанс контейнерной задачи (CTFd container plugin).

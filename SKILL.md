@@ -29,14 +29,14 @@ Ask the user (or read env) for:
 
 ```json
 {
-  "last": "brunner",
+  "last": "demo",
   "profiles": {
-    "brunner": {"host": "https://global.brunnerctf.dk", "token": "ctfd_..."}
+    "demo": {"host": "https://ctf.example.com", "token": "ctfd_..."}
   }
 }
 ```
 
-Then every CLI call shrinks to `python scripts/ctfd_client.py -p brunner <cmd>`
+Then every CLI call shrinks to `python scripts/ctfd_client.py -p demo <cmd>`
 (the `last`-used profile is the default when `-p` is omitted — the client
 updates it on each use). Precedence: explicit `--host/--token` > explicit
 `-p NAME` > `CTFD_HOST`/`CTFD_TOKEN` env > `last` profile. `profiles` lists
@@ -107,7 +107,7 @@ python scripts/ctfd_client.py -p <event> snapshot --out ~/ctf/<event>
 
 Замечания:
 1. Если `preflight` показал `direct_api.cloudflare=true` — переключайся на
-   CDP-мост (§6a) или `--proxy` (см. скилл cf-bypass).
+   CDP-мост (§6a) или `--proxy` (see the CF-bypass skill).
 2. TCP-инстансы за auth_proxy спрашивают `CTFd access token: ` первой строкой
    при подключении — это обычный API-токен клиента.
 3. Временные файлы события складывай в `tmp/` ВНУТРИ папки события
@@ -493,8 +493,8 @@ Or via CLI straight from Bash (global `--host`/`--token`/`--profile` are
 accepted BOTH before and after the subcommand; `-p` reads
 `~/.config/ctfd/profiles.json`, default = last used — see §0):
 ```
- python scripts/ctfd_client.py -p brunner challenges            # профиль вместо host/token
- python scripts/ctfd_client.py -p brunner submit 42 "flag{...}"
+ python scripts/ctfd_client.py -p demo challenges               # профиль вместо host/token
+ python scripts/ctfd_client.py -p demo submit 42 "flag{...}"
  python scripts/ctfd_client.py challenges --new                 # только новые дропы
  python scripts/ctfd_client.py challenges --offline --unsolved --sort value   # приоритизация без HTTP
  python scripts/ctfd_client.py scoreboard --diff                # своя позиция ±, кто кого обогнал
@@ -601,7 +601,7 @@ challenge page that spins up a container and shows `host:port`). **This is a
 per-host plugin/service, NOT part of the CTFd API core** — hand-rolled curl
 against guessed endpoints breaks on the next event. The client DOES ship a
 subcommand for the most common plugin (the `ctfd-containers`/whale-style
-`/api/v1/containers/*` API, seen live at CompFEST18):
+`/api/v1/containers/*` API, used by many events):
 
 ```bash
 python scripts/ctfd_client.py instances request <challenge_id>

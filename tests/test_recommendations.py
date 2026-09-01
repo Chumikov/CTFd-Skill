@@ -1,4 +1,4 @@
-"""Тесты улучшений по итогам пост-мортема BrunnerCTF — без сети.
+"""Тесты улучшений по итогам пост-мортема предыдущего CTF — без сети.
 
 Покрывает:
     - профили: resolution-приоритет, last-touch, маскировка токена
@@ -66,24 +66,24 @@ class TestProfiles:
             {
                 "last": "other",
                 "profiles": {
-                    "brunner": {"host": "https://global.brunnerctf.dk",
-                                "token": "ctfd_brunner"},
+                    "demo": {"host": "https://global.democtf.dk",
+                                "token": "ctfd_demo"},
                     "other": {"host": "https://x.example.com", "token": "ctfd_x"},
                 },
             }
         )
-        prof = m._resolve_profile("brunner")
-        assert prof["host"] == "https://global.brunnerctf.dk"
-        assert prof["token"] == "ctfd_brunner"
-        assert prof["name"] == "brunner"
+        prof = m._resolve_profile("demo")
+        assert prof["host"] == "https://global.democtf.dk"
+        assert prof["token"] == "ctfd_demo"
+        assert prof["name"] == "demo"
 
     def test_resolve_last_when_no_name(self, isolated_home):
         m._save_profiles(
-            {"last": "brunner",
-             "profiles": {"brunner": {"host": "https://b.dk", "token": "t"}}}
+            {"last": "demo",
+             "profiles": {"demo": {"host": "https://b.example.com", "token": "t"}}}
         )
         prof = m._resolve_profile(None)
-        assert prof is not None and prof["name"] == "brunner"
+        assert prof is not None and prof["name"] == "demo"
 
     def test_missing_explicit_name_raises(self, isolated_home):
         m._save_profiles({"profiles": {"a": {"host": "https://a.dk"}}})
@@ -119,17 +119,17 @@ class TestProfiles:
     def test_cli_profile_priority_explicit_beats_env(
         self, isolated_home, monkeypatch
     ):
-        # env указывает на example.com, -p brunner должен победить
+        # env указывает на example.com, -p demo должен победить
         m._save_profiles(
-            {"profiles": {"brunner": {"host": "https://b.dk",
+            {"profiles": {"demo": {"host": "https://b.example.com",
                                       "token": "ctfd_b"}}}
         )
         args = m.argparse.Namespace(
-            host=None, token=None, profile="brunner"
+            host=None, token=None, profile="demo"
         )
         c = m._client_from_args(args)
-        assert c.host == "https://b.dk"
-        assert m._load_profiles()["last"] == "brunner"
+        assert c.host == "https://b.example.com"
+        assert m._load_profiles()["last"] == "demo"
 
     def test_cli_explicit_host_token_beats_profile(
         self, isolated_home, monkeypatch
@@ -137,7 +137,7 @@ class TestProfiles:
         monkeypatch.delenv("CTFD_HOST", raising=False)
         monkeypatch.delenv("CTFD_TOKEN", raising=False)
         m._save_profiles(
-            {"last": "b", "profiles": {"b": {"host": "https://b.dk",
+            {"last": "b", "profiles": {"b": {"host": "https://b.example.com",
                                              "token": "ctfd_b"}}}
         )
         args = m.argparse.Namespace(
@@ -150,12 +150,12 @@ class TestProfiles:
         monkeypatch.delenv("CTFD_HOST", raising=False)
         monkeypatch.delenv("CTFD_TOKEN", raising=False)
         m._save_profiles(
-            {"last": "b", "profiles": {"b": {"host": "https://b.dk",
+            {"last": "b", "profiles": {"b": {"host": "https://b.example.com",
                                              "token": "ctfd_b"}}}
         )
         args = m.argparse.Namespace(host=None, token=None, profile=None)
         c = m._client_from_args(args)
-        assert c.host == "https://b.dk"
+        assert c.host == "https://b.example.com"
 
     def test_cli_missing_profile_exits(self, isolated_home):
         m._save_profiles({"profiles": {}})
