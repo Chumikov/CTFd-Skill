@@ -74,6 +74,46 @@ this. Token auth is simpler — prefer it whenever possible.
 > instead of JSON. The client detects this and can route everything through a
 > real browser tab (CDP browser bridge) — see §6a before fighting it manually.
 
+> **Proxy for the direct transport.** If your VPS IP is blocked by Cloudflare
+> but a SOCKS5 (e.g. WARP/wireproxy on `127.0.0.1`) is available, pass
+> `--proxy socks5://127.0.0.1:25345` (or env `CTFD_PROXY`) — every direct
+> request then rides the proxy. The CDP bridge ignores it (the browser has
+> its own route).
+
+## 0a. Типовой поток события (команды клиента)
+
+```bash
+# проверка доступа (прямой API / Cloudflare / токен / плагин контейнеров)
+python scripts/ctfd_client.py -p <event> preflight
+
+# полный дамп мероприятия в папку события
+python scripts/ctfd_client.py -p <event> dump --out ~/ctf/<event>
+#   → all_challenges.json (всё: описания, файлы, connection_info)
+#   → unsolved.txt (приоритет по очкам), flags.txt (скелет очереди сабмита)
+
+# контейнерные инстансы:
+python scripts/ctfd_client.py -p <event> instances request <challenge_id>
+python scripts/ctfd_client.py -p <event> instances renew <instance_uuid>
+
+# сдача флага: одиночная или батч-очередью (строки id|flag|status; статус
+# перезаписывается атомарно; конечные статусы повторно не отправляются):
+python scripts/ctfd_client.py -p <event> submit <id> 'FLAG{...}'
+python scripts/ctfd_client.py -p <event> submit --queue ~/ctf/<event>/flags.txt
+#   статусы: pending → correct | already_solved | incorrect | error
+
+# хэндофф-снапшот (решённое/нерешённое, несданные флаги, хвост PROGRESS.md):
+python scripts/ctfd_client.py -p <event> snapshot --out ~/ctf/<event>
+```
+
+Замечания:
+1. Если `preflight` показал `direct_api.cloudflare=true` — переключайся на
+   CDP-мост (§6a) или `--proxy` (см. скилл cf-bypass).
+2. TCP-инстансы за auth_proxy спрашивают `CTFd access token: ` первой строкой
+   при подключении — это обычный API-токен клиента.
+3. Временные файлы события складывай в `tmp/` ВНУТРИ папки события
+   (`~/ctf/<event>/tmp/`) — там они переживают ребут, в отличие от
+   системного `/tmp`.
+
 ## 1. Response envelope
 
 ```
@@ -558,10 +598,21 @@ and `events` to confirm no parallel trees appeared.
 
 Some events run per-player challenge instances (a deploy button on the
 challenge page that spins up a container and shows `host:port`). **This is a
-per-host plugin/service, NOT part of the CTFd API** — there is no standard
-`instance up/down` endpoint, so the client deliberately has no such
-subcommand. Hand-rolled curl against guessed endpoints breaks on the next
-event. Instead, when a challenge clearly needs a personal instance:
+per-host plugin/service, NOT part of the CTFd API core** — hand-rolled curl
+against guessed endpoints breaks on the next event. The client DOES ship a
+subcommand for the most common plugin (the `ctfd-containers`/whale-style
+`/api/v1/containers/*` API, seen live at CompFEST18):
+
+```bash
+python scripts/ctfd_client.py instances request <challenge_id>
+#   → {connection: {host, port, type}, instance_uuid, expires_at,
+#      renewal_count, max_renewals}
+python scripts/ctfd_client.py instances renew <instance_uuid>
+```
+
+TCP-инстансы за auth_proxy при подключении спрашивают `CTFd access token: ` —
+это обычный API-токен (первая строка ввода). If the event uses a DIFFERENT
+plugin (no `/api/v1/containers/*`), fall back to discovery:
 
 1. **Check the challenge detail first** — `get_challenge(id)` may already
    carry `connection_info`, or the (markdown-converted) description contains

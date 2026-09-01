@@ -9,8 +9,18 @@
 - **Флаги**: сабмит с обработкой всех ответов CTFd (`correct`, `incorrect`,
   `already_solved`, `partial`, `ratelimited`…), авто-backoff на 429,
   предупреждение «этот флаг уже отправлялся и был неверен» до траты попытки.
+  Батч-очередь `submit --queue flags.txt` — статусы в файле обновляются сами.
 - **Профили событий**: один раз сохранить host+токен в
   `~/.config/ctfd/profiles.json` — дальше просто `-p имя-события`.
+- **Боевой старт**: `preflight` — проверка доступа, Cloudflare, токена и
+  плагина контейнеров; `dump` — весь CTF одним файлом (задачи, условия,
+  файлы, инстансы) в папку события.
+- **Инстансы**: поднятие и продление контейнерных задач
+  (`instances request|renew`).
+- **Хэндофф**: `snapshot` — готовое резюме события (решено / нерешено /
+  несданные флаги) первым сообщением новой сессии.
+- **Прокси**: `--proxy socks5://...` — транспорт через локальный SOCKS5,
+  когда IP в бане у Cloudflare.
 - **Новое и приоритеты**: детект новых задач и анонсов организаторов;
   оффлайн-режим `challenges --offline --unsolved --sort value` без обращения
   к серверу.
@@ -77,6 +87,16 @@ python scripts/ctfd_client.py download-challenge 42     # воркспейс + �
 python scripts/ctfd_client.py status                    # сверка с сервером
 ```
 
+Боевой сценарий (старт CTF):
+
+```bash
+python scripts/ctfd_client.py -p demo preflight         # доступ/Cloudflare/токен
+python scripts/ctfd_client.py -p demo dump --out ~/ctf/demo   # весь CTF локально
+python scripts/ctfd_client.py -p demo instances request 18    # поднять инстанс
+python scripts/ctfd_client.py -p demo submit --queue ~/ctf/demo/flags.txt
+python scripts/ctfd_client.py -p demo snapshot --out ~/ctf/demo  # хэндофф
+```
+
 Из Python:
 
 ```python
@@ -108,7 +128,7 @@ if verdict.correct:
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/          # ~190 тестов, без HTTP (всё замокано)
+pytest tests/          # 200+ тестов, без HTTP (всё замокано)
 ```
 
 ## Лицензия
