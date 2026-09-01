@@ -734,12 +734,22 @@ class CTfdClient:
         timeout: float = 30.0,
         session: Optional[requests.Session] = None,
         bridge: Optional[str] = None,
+        proxy: Optional[str] = None,
     ):
         self.host = host.rstrip("/")
         self.timeout = timeout
         self.session = session or requests.Session()
         self._nonce: Optional[str] = None
         self._active_ws: Optional[Path] = None
+        # Прокси для прямого транспорта requests (socks5://... или http://...).
+        # Полезно, когда исходный IP в бане у Cloudflare, а WARP/wireproxy
+        # SOCKS5 поднят локально: --proxy socks5://127.0.0.1:25345.
+        # CDP-мост прокси не использует (браузер ходит своим маршрутом).
+        # Env: CTFD_PROXY.
+        _proxy = proxy or os.environ.get("CTFD_PROXY") or None
+        self.proxy: Optional[str] = _proxy
+        if _proxy:
+            self.session.proxies.update({"http": _proxy, "https": _proxy})
         # Транспорт: "auto" (по умолчанию; requests, при CloudflareBlocked
         # прозрачно переключаемся на CDP-мост), "cdp" (только мост),
         # "off"/"requests" (только requests). Env: CTFD_BRIDGE.
@@ -2545,6 +2555,324 @@ class CTfdClient:
         return result
 
     # -- управление собственными API-токенами --------------------------
+    # ------------------------------------------------------------------
+    #  Боевой воркфлоу CTF: контейнеры, dump, очередь сабмита, preflight,
+    #  snapshot (хэндофф). Добавлено по итогам CompFEST18 (см. POST-MORTEM).
+    # ------------------------------------------------------------------
+    def container_request(self, challenge_id: int) -> Dict[str, Any]:
+        """Поднять/продлить инстанс контейнерной задачи (CTFd container plugin).
+
+        POST /containers/request {"challenge_id": N}. Возвращает словарь с
+        connection (host/port/type), instance_uuid, expires_at (мс с эпохи),
+        renewal_count/max_renewals. Для TCP-инстансов за auth_proxy первая
+        строка при подключении — «CTFd access token: » (сюда годится
+        API-токен клиента).
+        """
+        return self._request(
+            "POST", "/containers/request", json_body={"challenge_id": int(challenge_id)}
+        )
+
+    def container_renew(self, instance_uuid: str) -> Dict[str, Any]:
+        """Продлить инстанс по uuid (POST /containers/renew).
+
+        Некоторые сборки плагина используют другой путь; при 404/405 бросаем
+        CTfdError с подсказкой перезапустить через container_request.
+        """
+        try:
+            return self._request(
+                "POST",
+                "/containers/renew",
+                json_body={"instance_uuid": str(instance_uuid)},
+            )
+        except CTfdError as e:
+            raise CTfdError(
+                f"{e}; эндпоинт renew недоступен — поднимите инстанс заново: "
+                f"c.container_request(<challenge_id>)"
+            ) from e
+
+    @staticmethod
+    def _expires_remaining_ms(expires_at: Any) -> Optional[int]:
+        """expires_at (мс с эпохи или ISO-строка) → оставшиеся мс (или None)."""
+        import datetime as _dt
+
+        if expires_at in (None, ""):
+            return None
+        try:
+            if isinstance(expires_at, (int, float)):
+                return int(expires_at) - int(_dt.datetime.now().timestamp() * 1000)
+            s = str(expires_at).replace("Z", "+00:00")
+            dt = _dt.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            now = _dt.datetime.now(_dt.timezone.utc)
+            return int((dt - now).total_seconds() * 1000)
+        except Exception:
+            return None
+
+    def event_dump(self, out_dir: str, *, detail: str = "full") -> Dict[str, Any]:
+        """Разовый дамп мероприятия для боевого старта.
+
+        Пишет в ``out_dir``:
+          - ``all_challenges.json`` — весь список с полными деталями
+            (описание, файлы, connection_info, solved_by_me, …);
+          - ``unsolved.txt`` — нерешённые, отсортированные по убыванию очков
+            (базовая приоритизация);
+          - ``flags.txt`` — скелет очереди сабмита (``id|flag|pending``),
+            пустой; заполняется по мере нахождения флагов, сдаётся через
+            :meth:`submit_queue`.
+
+        Возвращает сводку (кол-во задач, решённых, суммарный балл и т.п.).
+        Временные файлы события держи в ``tmp/`` внутри папки события —
+        системный /tmp вычищается при ребуте вместе с артефактами.
+        """
+        out = Path(out_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        challenges = self.list_challenges(detail=detail, update_seen=False,
+                                          poll_notifications=False)
+        me = {}
+        try:
+            me = self.me() or {}
+        except Exception:
+            pass
+        payload = {
+            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "host": self.host,
+            "user": me.get("name") if isinstance(me, dict) else None,
+            "challenges": challenges,
+        }
+        (out / "all_challenges.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        unsolved = sorted(
+            (c for c in challenges if not c.get("solved_by_me")),
+            key=lambda c: (c.get("value") or 0), reverse=True,
+        )
+        (out / "unsolved.txt").write_text(
+            "\n".join(f"{c.get('value') or 0}\t{c['id']}\t{c['name']}" for c in unsolved)
+            + ("\n" if unsolved else ""),
+            encoding="utf-8",
+        )
+        flags_path = out / "flags.txt"
+        if not flags_path.exists():
+            flags_path.write_text(
+                "# очередь сабмита: id|flag|status  (status: pending|correct|"
+                "incorrect|already_solved|error)\n", encoding="utf-8"
+            )
+        solved = [c for c in challenges if c.get("solved_by_me")]
+        summary = {
+            "out": str(out),
+            "challenges": len(challenges),
+            "solved": len(solved),
+            "unsolved": len(unsolved),
+            "points_available": sum(c.get("value") or 0 for c in challenges),
+            "points_solved": sum(c.get("value") or 0 for c in solved),
+        }
+        print(
+            f"[ctfd] dump: {summary['challenges']} задач, решено "
+            f"{summary['solved']} ({summary['points_solved']}/"
+            f"{summary['points_available']} очков) → {out}",
+            file=sys.stderr,
+        )
+        return summary
+
+    def submit_queue(self, path: str) -> Dict[str, Any]:
+        """Батч-сдача флагов из файла очереди.
+
+        Формат строк ``id|flag[|status]`` (комментарии ``#``, пустые — игнор).
+        Статусы: pending → correct/incorrect/already_solved/error; строки с
+        конечным статусом не отправляются повторно. Файл перезаписывается
+        атомарно после каждой попытки (прерывание безопасно). Умный ретрай
+        429 уже внутри :meth:`attempt`.
+
+        Возвращает сводку {total, correct, already_solved, incorrect, error}.
+        """
+        p = Path(path).expanduser()
+        if not p.exists():
+            raise CTfdError(f"файл очереди не найден: {p}")
+        rows: List[Dict[str, Any]] = []
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                rows.append({"raw": raw, "skip": True})
+                continue
+            parts = [x.strip() for x in line.split("|")]
+            if len(parts) < 2 or not parts[0].isdigit():
+                rows.append({"raw": raw, "skip": True})
+                continue
+            status = (parts[2] if len(parts) > 2 else "pending").lower()
+            rows.append({
+                "raw": raw, "skip": False, "id": int(parts[0]),
+                "flag": parts[1], "status": status,
+            })
+        done = {"correct": 0, "already_solved": 0, "incorrect": 0, "error": 0}
+        for r in rows:
+            if r.get("skip") or r["status"] in (
+                "correct", "already_solved", "incorrect"
+            ):
+                if not r.get("skip") and r["status"] in done:
+                    done[r["status"]] += 1
+                continue
+            try:
+                verdict = self.attempt(r["id"], r["flag"])
+                if verdict.already_solved:
+                    r["status"] = "already_solved"
+                elif verdict.correct:
+                    r["status"] = "correct"
+                elif verdict.incorrect:
+                    r["status"] = "incorrect"
+                else:
+                    r["status"] = "error"
+                msg = getattr(verdict, "message", "")
+                r["message"] = msg[:120] if isinstance(msg, str) else str(msg)[:120]
+            except Exception as e:  # сеть/CF/прочее — помечаем и идём дальше
+                r["status"] = "error"
+                r["message"] = str(e)[:160]
+            done[r["status"]] = done.get(r["status"], 0) + 1
+            # атомарная перезапись очереди после каждой попытки
+            out_lines = []
+            for x in rows:
+                if x.get("skip"):
+                    out_lines.append(x["raw"])
+                else:
+                    out_lines.append(
+                        f"{x['id']}|{x['flag']}|{x['status']}"
+                    )
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+            tmp.replace(p)
+            print(
+                f"[ctfd] queue: #{r['id']} → {r['status']}", file=sys.stderr
+            )
+        summary = {
+            "file": str(p), "total": sum(done.values()), **done,
+            "all_clear": done["correct"] + done["already_solved"]
+            == sum(done.values()),
+        }
+        print(f"[ctfd] queue summary: {json.dumps(done)}", file=sys.stderr)
+        return summary
+
+    def preflight(self) -> Dict[str, Any]:
+        """Пре-флайт чек доступности: прямой API, Cloudflare, токен.
+
+        Проверки (каждая — отдельный ключ результата):
+          - ``direct_api``: GET /api/v1/challenges прямым requests (без
+            моста). Поля: status, cloudflare (True = ответ похож на страницу
+            Cloudflare), ok.
+          - ``token``: клиентский запрос /users/me (транспорт auto — при CF
+            сам уйдёт в CDP-мост, это НЕ ошибка; смотри transport).
+          - ``containers``: наличие плагина — только GET-зонд /containers,
+            без побочных эффектов (404 = плагина нет; 401/403/405 = есть).
+        """
+        res: Dict[str, Any] = {"host": self.host, "ok": False}
+        # 1) прямой запрос без моста
+        try:
+            r = requests.get(
+                f"{self.host}/api/v1/challenges",
+                timeout=min(self.timeout, 15),
+                headers={"Accept": "application/json"},
+                proxies={"http": self.proxy, "https": self.proxy}
+                if self.proxy else None,
+            )
+            cf = bool(_looks_like_cloudflare(r))
+            res["direct_api"] = {
+                "status": r.status_code,
+                "cloudflare": cf,
+                "ok": bool(r.ok and not cf),
+            }
+            if cf:
+                res["cloudflare_note"] = (
+                    "хост за Cloudflare: CLI-транспорт будет уходить в "
+                    "CDP-мост (нужен Chrome с --remote-debugging-port и "
+                    "пройденной капчей) либо используйте --proxy"
+                )
+        except Exception as e:
+            res["direct_api"] = {"ok": False, "error": str(e)[:200]}
+        # 2) токен
+        try:
+            me = self.me()
+            res["token"] = {
+                "ok": True,
+                "user": me.get("name") if isinstance(me, dict) else None,
+                "transport": "cdp-bridge" if self._bridge else "requests",
+            }
+        except CloudflareBlocked as e:
+            res["token"] = {"ok": False, "cloudflare": True, "error": str(e)[:200]}
+        except Exception as e:
+            res["token"] = {"ok": False, "error": str(e)[:200]}
+        # 3) контейнерный плагин
+        try:
+            r = requests.get(
+                f"{self.host}/api/v1/containers",
+                timeout=min(self.timeout, 15),
+                headers={
+                    "Accept": "application/json",
+                    **({"Authorization": self.session.headers["Authorization"]}
+                       if "Authorization" in self.session.headers else {}),
+                },
+                proxies={"http": self.proxy, "https": self.proxy}
+                if self.proxy else None,
+            )
+            res["containers_plugin"] = {
+                "status": r.status_code,
+                # 404 = плагина нет; 401/403/405/200 = эндпоинт существует
+                "present": r.status_code != 404,
+            }
+        except Exception as e:
+            res["containers_plugin"] = {"present": None, "error": str(e)[:160]}
+        res["ok"] = bool(
+            (res.get("token") or {}).get("ok")
+        )
+        return res
+
+    def snapshot(self, out_dir: Optional[str] = None) -> str:
+        """Хэндофф-снапшот: markdown-промт для продолжения в новой сессии.
+
+        Собирает: событие/юзер, решённые/нерешённые (с очками), содержимое
+        flags.txt (если есть), хвост PROGRESS.md (если есть) из ``out_dir``.
+        Печатает готовый текст — вставляется первым сообщением новой сессии.
+        """
+        challenges = self.list_challenges(detail="list", update_seen=False,
+                                          poll_notifications=False)
+        me = {}
+        try:
+            me = self.me() or {}
+        except Exception:
+            pass
+        solved = [c for c in challenges if c.get("solved_by_me")]
+        unsolved = sorted(
+            (c for c in challenges if not c.get("solved_by_me")),
+            key=lambda c: (c.get("value") or 0), reverse=True,
+        )
+        lines = [
+            "# Хэндофф CTF-сессии",
+            f"Хост: {self.host} | юзер: {me.get('name') if isinstance(me, dict) else '?'}",
+            f"Решено: {len(solved)} задач, "
+            f"{sum(c.get('value') or 0 for c in solved)} очков",
+            "",
+            "## Решённые",
+            *[f"- [{c['id']}] {c['name']} ({c.get('value')})" for c in solved],
+            "",
+            "## Нерешённые (по убыванию очков)",
+            *[f"- [{c['id']}] {c['name']} ({c.get('value')}) [{c.get('category')}]"
+              for c in unsolved],
+        ]
+        if out_dir:
+            d = Path(out_dir).expanduser()
+            fq = d / "flags.txt"
+            if fq.exists():
+                pend = [l for l in fq.read_text(encoding="utf-8").splitlines()
+                        if l.strip() and not l.startswith("#")
+                        and l.strip().lower().endswith("pending")]
+                if pend:
+                    lines += ["", "## Несданные флаги в очереди (!!! сдать первым делом)"]
+                    lines += [f"- {l}" for l in pend]
+            prog = d / "PROGRESS.md"
+            if prog.exists():
+                tail = prog.read_text(encoding="utf-8").splitlines()[-60:]
+                lines += ["", "## Хвост PROGRESS.md", "```markdown",
+                          *tail, "```"]
+        return "\n".join(lines)
+
     def generate_token(
         self,
         expiration: Optional[str] = None,
@@ -3173,7 +3501,8 @@ def _client_from_args(
             f"ошибка: требуется --token, ${CTFD_TOKEN_ENV} или профиль "
             f"(-p name, {_profiles_path()})"
         )
-    return CTfdClient(host, token=token or None)
+    proxy = getattr(args, "proxy", None) or os.environ.get("CTFD_PROXY") or None
+    return CTfdClient(host, token=token or None, proxy=proxy)
 
 
 def _print(obj: Any) -> None:
@@ -3221,8 +3550,41 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("id", type=int)
 
     a = sub.add_parser("submit", help="Подать флаг")
-    a.add_argument("id", type=int)
-    a.add_argument("flag")
+    a.add_argument("id", nargs="?", type=int)
+    a.add_argument("flag", nargs="?")
+    a.add_argument(
+        "--queue", metavar="FILE",
+        help="батч-сдача из файла очереди (строки id|flag|status); "
+             "id/flag тогда не указываются",
+    )
+
+    pf = sub.add_parser(
+        "preflight",
+        help="Пре-флайт чек: доступность, Cloudflare, токен, плагин контейнеров",
+    )
+    dm = sub.add_parser(
+        "dump",
+        help="Боевой дамп мероприятия: all_challenges.json + unsolved.txt + "
+             "скелет flags.txt",
+    )
+    dm.add_argument(
+        "--out", default=None,
+        help="рабочая директория (по умолчанию ~/ctf/<slug> — НЕ /tmp!)",
+    )
+    dm.add_argument(
+        "--list", action="store_true",
+        help="без догрузки деталей (быстрее, но без описаний/файлов)",
+    )
+    ins = sub.add_parser(
+        "instances", help="Контейнерные инстансы: request | renew",
+    )
+    ins.add_argument("action", choices=["request", "renew"])
+    ins.add_argument("target", help="challenge_id (для request) или instance_uuid (для renew)")
+    sn = sub.add_parser(
+        "snapshot",
+        help="Хэндофф-снапшот: markdown для продолжения в новой сессии",
+    )
+    sn.add_argument("--out", default=None, help="директория с flags.txt/PROGRESS.md")
 
     sub.add_parser("me", help="Текущий пользователь")
     sub.add_parser("solves", help="Мои решения")
@@ -3300,9 +3662,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument("--base", default="~/Downloads/ctf", help="база воркспейсов")
 
-    # Глобальные --host/--token/--profile работают И ДО, И ПОСЛЕ сабкоманды:
-    # дублируем их в каждый subparser с default=SUPPRESS — значение, заданное
-    # после сабкоманды, попадает в namespace, не перетирая заданное до неё.
+    # Глобальные --host/--token/--profile/--proxy работают И ДО, И ПОСЛЕ
+    # сабкоманды: дублируем их в каждый subparser с default=SUPPRESS —
+    # значение, заданное после сабкоманды, попадает в namespace, не
+    # перетирая заданное до неё.
     for _sp in sub.choices.values():
         _sp.add_argument(
             "--host", default=argparse.SUPPRESS,
@@ -3315,6 +3678,11 @@ def _build_parser() -> argparse.ArgumentParser:
         _sp.add_argument(
             "-p", "--profile", default=argparse.SUPPRESS,
             help="то же, что глобальный --profile (можно указать после подкоманды)",
+        )
+        _sp.add_argument(
+            "--proxy", default=argparse.SUPPRESS,
+            help="прокси для прямого транспорта (socks5://host:port; "
+                 "или env $CTFD_PROXY)",
         )
     return p
 
@@ -3373,7 +3741,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif cmd == "challenge":
         _print(c.get_challenge(args.id))
     elif cmd == "submit":
-        _print(c.attempt(args.id, args.flag))
+        if args.queue:
+            _print(c.submit_queue(args.queue))
+        elif args.id is not None and args.flag:
+            _print(c.attempt(args.id, args.flag))
+        else:
+            sys.exit("ошибка: укажите id и флаг, либо --queue FILE")
+    elif cmd == "preflight":
+        _print(c.preflight())
+    elif cmd == "dump":
+        out = args.out
+        if not out:
+            slug = c._derive_event_slug()
+            out = str(Path("~/ctf") / slug)
+        _print(c.event_dump(out, detail="list" if args.list else "full"))
+    elif cmd == "instances":
+        if args.action == "request":
+            _print(c.container_request(int(args.target)))
+        else:
+            _print(c.container_renew(args.target))
+    elif cmd == "snapshot":
+        print(c.snapshot(args.out))
     elif cmd == "me":
         _print(c.me())
     elif cmd == "solves":

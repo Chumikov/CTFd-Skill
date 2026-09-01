@@ -555,9 +555,10 @@ class TestCliMain:
         captured = {}
 
         class FakeClient:
-            def __init__(self, host, token=None):
+            def __init__(self, host, token=None, proxy=None):
                 captured["host"] = host
                 captured["token"] = token
+                captured["proxy"] = proxy
 
             def attempt(self, cid, flag, **kw):
                 captured["attempt"] = (cid, flag)
